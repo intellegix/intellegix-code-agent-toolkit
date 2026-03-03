@@ -232,8 +232,18 @@ class MockPopen:
         self.stderr = io.StringIO("")
         self.returncode = returncode
         self.pid = 99999
+        self.communicate_timeout: float | None = None
+        self.wait_timeout: float | None = None
+        self._wait_called = False
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.communicate_timeout = timeout
+        return self.stdout.read(), self.stderr.read()
 
     def wait(self, timeout: float | None = None) -> int:
+        if not self._wait_called:
+            self.wait_timeout = timeout
+            self._wait_called = True
         return self.returncode
 
     def kill(self) -> None:
@@ -258,13 +268,17 @@ def make_popen_dispatcher(
 
     Claude commands return MockPopen with NDJSON stream.
     Non-Claude Popen calls (e.g. taskkill) return a no-op MockPopen.
+    Access factory.last_claude_popen after run to inspect the MockPopen instance.
     """
     def factory(*args, **kwargs):
         cmd = args[0] if args else kwargs.get("args", [])
         if isinstance(cmd, list) and cmd and cmd[0] == "claude":
             if claude_side_effect is not None:
                 raise claude_side_effect
-            return MockPopen(claude_ndjson or "", claude_returncode)
+            popen = MockPopen(claude_ndjson or "", claude_returncode)
+            factory.last_claude_popen = popen
+            return popen
         # taskkill or other subprocess.Popen calls
         return MockPopen("", 0)
+    factory.last_claude_popen = None
     return factory

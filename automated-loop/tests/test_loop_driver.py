@@ -703,11 +703,10 @@ class TestConsecutiveTimeouts:
 
 
 class TestModelAwareTimeout:
-    @patch("loop_driver.threading.Timer")
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_opus_gets_double_timeout(
-        self, mock_run: MagicMock, mock_popen: MagicMock, mock_timer: MagicMock,
+        self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
         """Opus model gets 2x the base timeout."""
@@ -715,23 +714,23 @@ class TestModelAwareTimeout:
         config.limits.timeout_seconds = 600
         config.claude.model = "opus"
 
-        mock_timer.return_value = MagicMock()  # No-op timer
-        mock_popen.side_effect = make_popen_dispatcher(
+        dispatcher = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.50, 10, "PROJECT_COMPLETE"),
         )
+        mock_popen.side_effect = dispatcher
         mock_run.side_effect = make_subprocess_dispatcher()
 
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        # Timer was called with (effective_timeout, callback)
-        assert mock_timer.call_args[0][0] == 1200  # 600 * 2.0
+        # wait() was called with effective_timeout
+        assert dispatcher.last_claude_popen is not None
+        assert dispatcher.last_claude_popen.wait_timeout == 1200  # 600 * 2.0
 
-    @patch("loop_driver.threading.Timer")
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_sonnet_gets_normal_timeout(
-        self, mock_run: MagicMock, mock_popen: MagicMock, mock_timer: MagicMock,
+        self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
         """Sonnet model gets 1x the base timeout (no scaling)."""
@@ -739,23 +738,23 @@ class TestModelAwareTimeout:
         config.limits.timeout_seconds = 600
         config.claude.model = "sonnet"
 
-        mock_timer.return_value = MagicMock()  # No-op timer
-        mock_popen.side_effect = make_popen_dispatcher(
+        dispatcher = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.50, 10, "PROJECT_COMPLETE"),
         )
+        mock_popen.side_effect = dispatcher
         mock_run.side_effect = make_subprocess_dispatcher()
 
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        # Timer was called with (effective_timeout, callback)
-        assert mock_timer.call_args[0][0] == 600  # 600 * 1.0
+        # wait() was called with effective_timeout
+        assert dispatcher.last_claude_popen is not None
+        assert dispatcher.last_claude_popen.wait_timeout == 600  # 600 * 1.0
 
-    @patch("loop_driver.threading.Timer")
     @patch("subprocess.Popen")
     @patch("subprocess.run")
     def test_unknown_model_gets_1x_timeout(
-        self, mock_run: MagicMock, mock_popen: MagicMock, mock_timer: MagicMock,
+        self, mock_run: MagicMock, mock_popen: MagicMock,
         project_dir: Path, config: WorkflowConfig,
     ) -> None:
         """Unknown model defaults to 1x multiplier."""
@@ -763,17 +762,18 @@ class TestModelAwareTimeout:
         config.limits.timeout_seconds = 300
         config.claude.model = "custom-model"
 
-        mock_timer.return_value = MagicMock()  # No-op timer
-        mock_popen.side_effect = make_popen_dispatcher(
+        dispatcher = make_popen_dispatcher(
             claude_ndjson=build_ndjson_stream("s1", 0.10, 5, "PROJECT_COMPLETE"),
         )
+        mock_popen.side_effect = dispatcher
         mock_run.side_effect = make_subprocess_dispatcher()
 
         driver = LoopDriver(project_dir, config)
         driver.run()
 
-        # Timer was called with (effective_timeout, callback)
-        assert mock_timer.call_args[0][0] == 300  # 300 * 1.0 (default)
+        # wait() was called with effective_timeout
+        assert dispatcher.last_claude_popen is not None
+        assert dispatcher.last_claude_popen.wait_timeout == 300  # 300 * 1.0 (default)
 
     @patch("subprocess.Popen")
     @patch("subprocess.run")

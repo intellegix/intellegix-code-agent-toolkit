@@ -37,7 +37,7 @@ class LimitsConfig(BaseModel):
     """Iteration and timeout limits."""
 
     max_iterations: int = Field(default=50, ge=1, le=500)
-    timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    timeout_seconds: int = Field(default=300, ge=30, le=7200)
     max_per_iteration_budget_usd: float = Field(default=5.0, gt=0)
     max_total_budget_usd: float = Field(default=50.0, gt=0)
     max_turns_per_iteration: int = Field(default=50, ge=1, le=200)

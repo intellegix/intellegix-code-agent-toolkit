@@ -1,8 +1,8 @@
 """Cross-platform Python loop driver for automated Claude Code + Perplexity research.
 
 Primary entry point — replaces PowerShell as the main loop driver.
-Uses subprocess.Popen() to stream NDJSON from claude CLI line-by-line,
-handling the Windows hang bug (#25629) where stdout doesn't close after result.
+Uses subprocess.Popen() with stdout redirected to a temp file to bypass
+Node.js pipe buffering on Windows (Claude CLI 2.1.34+).
 """
 
 from __future__ import annotations
@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -673,12 +675,12 @@ class LoopDriver:
     def _invoke_claude(
         self, prompt: str, resume_session_id: Optional[str] = None
     ) -> ParsedStream:
-        """Spawn claude CLI and stream NDJSON output line-by-line.
+        """Spawn claude CLI and collect NDJSON output via temp file.
 
-        Uses subprocess.Popen instead of subprocess.run to handle the Windows
-        hang bug (#25629) where Claude CLI doesn't close stdout after the result
-        event. We read line-by-line, stop when we see the result event, and kill
-        the process ourselves.
+        Redirects stdout to a temp file instead of a pipe to bypass Node.js
+        pipe buffering on Windows. When stdout is a file, Node.js uses
+        synchronous writes (no buffering), so data is available even if the
+        process hangs after finishing (bug #25629).
         """
         # Apply model-aware max-turns cap
         max_turns = self.config.limits.max_turns_per_iteration
@@ -722,30 +724,47 @@ class LoopDriver:
         # Build env with agent ID if running as part of multi-agent
         proc_env = None
         if self.agent_id:
-            import os
             proc_env = os.environ.copy()
             proc_env["CLAUDE_AGENT_ID"] = self.agent_id
+
+        # Create temp files for stdout/stderr to bypass Node.js pipe buffering.
+        # Node.js uses synchronous writes to file descriptors (no buffering),
+        # unlike pipes where it block-buffers and data is lost if process is killed.
+        stdout_path = os.path.join(
+            tempfile.gettempdir(), f"claude_stdout_{os.getpid()}.ndjson"
+        )
+        stderr_path = os.path.join(
+            tempfile.gettempdir(), f"claude_stderr_{os.getpid()}.log"
+        )
+        stdout_f = open(stdout_path, "w", encoding="utf-8")
+        stderr_f = open(stderr_path, "w", encoding="utf-8")
 
         try:
             proc = subprocess.Popen(
                 args,
                 cwd=str(self.project_path),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                stdout=stdout_f,
+                stderr=stderr_f,
                 env=proc_env,
             )
         except FileNotFoundError:
+            stdout_f.close()
+            stderr_f.close()
             logger.error("claude CLI not found. Ensure 'claude' is on PATH.")
             return ParsedStream()
 
-        # Timer kills process on timeout (handles Windows hang bug)
-        timed_out = False
+        # Close our file handles — child process inherited the OS handles
+        stdout_f.close()
+        stderr_f.close()
 
-        def _on_timeout() -> None:
-            nonlocal timed_out
+        logger.debug(
+            "Claude PID: %d, output file: %s", proc.pid, stdout_path
+        )
+
+        timed_out = False
+        try:
+            proc.wait(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
             timed_out = True
             logger.warning(
                 "Claude timed out after %ds (base: %ds, multiplier: %.1fx for %s)",
@@ -755,60 +774,6 @@ class LoopDriver:
                 self.config.claude.model,
             )
             self._kill_process_tree(proc.pid)
-            # Fallback: Python-native kill in case taskkill failed
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-        timer = threading.Timer(effective_timeout, _on_timeout)
-        timer.start()
-
-        # Drain stderr in background to prevent pipe buffer deadlock
-        stderr_lines: list[str] = []
-        stderr_thread = threading.Thread(
-            target=self._drain_pipe, args=(proc.stderr, stderr_lines), daemon=True
-        )
-        stderr_thread.start()
-
-        # Read stdout line-by-line, parsing NDJSON events
-        # Use explicit readline() for more responsive pipe reading
-        logger.debug("Claude PID: %d, reading NDJSON events...", proc.pid)
-        events: list = []
-        line_count = 0
-        deadline = time.monotonic() + effective_timeout + 30  # 30s grace beyond timer
-        try:
-            while True:
-                # Secondary timeout: break if well past deadline (timer kill failed)
-                if time.monotonic() > deadline:
-                    logger.error(
-                        "Readline deadline exceeded (timer kill likely failed). "
-                        "Force-killing PID %d.", proc.pid,
-                    )
-                    timed_out = True
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                    self._kill_process_tree(proc.pid)
-                    break
-                line = proc.stdout.readline()
-                if not line:
-                    break  # EOF — pipe closed
-                line_count += 1
-                event = parse_ndjson_line(line)
-                if event:
-                    events.append(event)
-                    logger.debug(
-                        "NDJSON event #%d: type=%s", len(events), event.type
-                    )
-                    if event.type == "result":
-                        break
-        except (OSError, ValueError):
-            pass  # Pipe closed by timeout kill
-        finally:
-            timer.cancel()
-            self._kill_process_tree(proc.pid)
             try:
                 proc.kill()
             except OSError:
@@ -817,6 +782,67 @@ class LoopDriver:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        except OSError:
+            pass  # Process died unexpectedly
+
+        # After kill (TerminateProcess), wait for OS to flush file buffers.
+        # Normal exit doesn't need this — Node.js flushes on process.exit().
+        if timed_out:
+            time.sleep(2)
+
+        # Read output from temp files — data is there even if process hung/was killed
+        stdout_text = ""
+        stderr_text = ""
+        try:
+            with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
+                stdout_text = f.read()
+        except OSError:
+            pass
+        try:
+            with open(stderr_path, "r", encoding="utf-8", errors="replace") as f:
+                stderr_text = f.read()
+        except OSError:
+            pass
+
+        logger.debug(
+            "Temp file read: stdout=%d chars, stderr=%d chars, file=%s",
+            len(stdout_text), len(stderr_text), stdout_path,
+        )
+
+        # Fallback: read from proc.stdout if temp file was empty (test/mock path)
+        if not stdout_text and hasattr(proc, "stdout") and proc.stdout:
+            try:
+                stdout_text = proc.stdout.read()
+            except (ValueError, IOError, AttributeError):
+                pass
+        if not stderr_text and hasattr(proc, "stderr") and proc.stderr:
+            try:
+                stderr_text = proc.stderr.read()
+            except (ValueError, IOError, AttributeError):
+                pass
+
+        # Cleanup temp files
+        for path in (stdout_path, stderr_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        # Parse collected NDJSON lines
+        events: list = []
+        line_count = 0
+        if stdout_text:
+            for line in stdout_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                line_count += 1
+                event = parse_ndjson_line(line)
+                if event:
+                    events.append(event)
+                    logger.debug(
+                        "NDJSON event #%d: type=%s", len(events), event.type
+                    )
 
         logger.debug(
             "Read %d lines, %d events from Claude stdout", line_count, len(events)
@@ -824,10 +850,15 @@ class LoopDriver:
         parsed = process_events(events)
 
         # Log stderr
-        stderr_thread.join(timeout=2)
-        stderr_text = "".join(stderr_lines)
         if stderr_text:
             logger.debug("Claude stderr (first 500 chars): %s", stderr_text[:500])
+
+        # Ensure process is fully cleaned up
+        self._kill_process_tree(proc.pid)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
         returncode = proc.returncode or 0
         if timed_out and not parsed.result:
