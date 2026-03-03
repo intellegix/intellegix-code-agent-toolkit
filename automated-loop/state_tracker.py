@@ -79,9 +79,14 @@ class WorkflowState(BaseModel):
 class StateTracker:
     """Manages persistent workflow state in .workflow/state.json."""
 
-    def __init__(self, project_path: str | Path) -> None:
+    def __init__(
+        self, project_path: str | Path, workflow_dir: Optional[Path] = None
+    ) -> None:
         self.project_path = Path(project_path)
-        self.state_path = self.project_path / ".workflow" / "state.json"
+        if workflow_dir is not None:
+            self.state_path = workflow_dir / "state.json"
+        else:
+            self.state_path = self.project_path / ".workflow" / "state.json"
         self.state = WorkflowState()
 
     @staticmethod

@@ -279,6 +279,9 @@ class ResearchBridge:
             "You are a development strategy advisor analyzing a coding session.",
             "Given the project context below, provide strategic analysis and concrete next steps.",
             "",
+            f"## Project Path",
+            f"`{self.project_path.resolve()}`",
+            "",
         ]
 
         if focus_area:

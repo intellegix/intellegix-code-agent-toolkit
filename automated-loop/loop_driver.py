@@ -58,12 +58,14 @@ class LoopDriver:
         dry_run: bool = False,
         smoke_test: bool = False,
         skip_preflight: bool = False,
+        agent_id: Optional[str] = None,
     ) -> None:
         self.project_path = Path(project_path).resolve()
         self.config = config
         self.dry_run = dry_run
         self.smoke_test = smoke_test
         self.skip_preflight = skip_preflight
+        self.agent_id = agent_id
 
         if self.smoke_test:
             self.config.limits.max_iterations = 1
@@ -79,7 +81,13 @@ class LoopDriver:
         self._gate_existed_at_start: bool = self._check_gate_exists_at_start()
         self._using_fallback = False
         self._original_model: Optional[str] = None
-        self.tracker = StateTracker(self.project_path)
+
+        # Agent-aware state routing
+        workflow_dir: Optional[Path] = None
+        if self.agent_id:
+            agent_state = self.config.multi_agent.agent_state_dir
+            workflow_dir = self.project_path / agent_state / self.agent_id / ".workflow"
+        self.tracker = StateTracker(self.project_path, workflow_dir=workflow_dir)
         self.bridge = ResearchBridge(
             self.project_path,
             retry_config=config.retry,
@@ -123,8 +131,17 @@ class LoopDriver:
             "iteration": self.tracker.state.iteration,
             **data,
         }
+        if self.agent_id:
+            event["agent_id"] = self.agent_id
         try:
-            trace_path = self.project_path / ".workflow" / "trace.jsonl"
+            if self.agent_id:
+                agent_state = self.config.multi_agent.agent_state_dir
+                trace_path = (
+                    self.project_path / agent_state / self.agent_id
+                    / ".workflow" / "trace.jsonl"
+                )
+            else:
+                trace_path = self.project_path / ".workflow" / "trace.jsonl"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             # Rotate if over limit
             max_size = self.config.limits.trace_max_size_bytes
@@ -702,6 +719,13 @@ class LoopDriver:
         )
         effective_timeout = int(self.config.limits.timeout_seconds * timeout_multiplier)
 
+        # Build env with agent ID if running as part of multi-agent
+        proc_env = None
+        if self.agent_id:
+            import os
+            proc_env = os.environ.copy()
+            proc_env["CLAUDE_AGENT_ID"] = self.agent_id
+
         try:
             proc = subprocess.Popen(
                 args,
@@ -711,6 +735,7 @@ class LoopDriver:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                env=proc_env,
             )
         except FileNotFoundError:
             logger.error("claude CLI not found. Ensure 'claude' is on PATH.")
@@ -1241,7 +1266,14 @@ class LoopDriver:
             "tool_usage_counts": tool_counts,
             "total_files_modified": total_files_modified,
         }
-        path = self.project_path / ".workflow" / "metrics_summary.json"
+        if self.agent_id:
+            agent_state = self.config.multi_agent.agent_state_dir
+            path = (
+                self.project_path / agent_state / self.agent_id
+                / ".workflow" / "metrics_summary.json"
+            )
+        else:
+            path = self.project_path / ".workflow" / "metrics_summary.json"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -1268,6 +1300,7 @@ def main() -> None:
     parser.add_argument("--no-stagnation-check", action="store_true", help="Disable diminishing returns detection")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip Claude CLI preflight check")
     parser.add_argument("--config", default=None, help="Path to config.json")
+    parser.add_argument("--agent-id", default=None, help="Agent ID for multi-agent mode (e.g., agent-1)")
     args = parser.parse_args()
 
     # Setup logging with redaction
@@ -1317,6 +1350,7 @@ def main() -> None:
         dry_run=args.dry_run,
         smoke_test=args.smoke_test,
         skip_preflight=args.skip_preflight,
+        agent_id=args.agent_id,
     )
     exit_code = driver.run()
     sys.exit(exit_code)

@@ -47,7 +47,7 @@ That's it. The loop reads your project's `CLAUDE.md` for instructions, spawns Cl
 └──────────────┘
 ```
 
-**Six modules:**
+**Eight modules:**
 
 | Module | Role |
 |--------|------|
@@ -57,6 +57,8 @@ That's it. The loop reads your project's `CLAUDE.md` for instructions, spawns Cl
 | `state_tracker.py` | Persists loop state, enforces budgets, computes per-model analytics |
 | `config.py` | Pydantic validation of `.workflow/config.json` with model-aware scaling |
 | `log_redactor.py` | Scrubs API keys and secrets from log output |
+| `file_locking.py` | Dropbox-safe file locking for multi-agent orchestration (write-wait-verify protocol) |
+| `multi_agent.py` | Multi-agent coordination — workspace setup, process launching, dashboard, merge phase |
 
 ## Model Selection
 
@@ -88,11 +90,19 @@ The loop includes an automatic **fallback chain**: if Opus hits 2 consecutive ti
 - **Stagnation detection** — two-strike system: resets session first, then exits (code 3)
 - **Timeout cooldown** — exponential backoff (60s base, 300s cap) between timeout retries
 
-### `/orchestrator` Command
+### `/orchestrator` Command (Single-Loop)
 - **Single-loop execution** — manages exactly one `loop_driver.py` process at a time; user defines the task, no decomposition
 - **4-phase lifecycle** — Planning (write CLAUDE.md) → Launching → Monitoring (10-min checks) → Reporting
 - **Desktop notifications** — Windows toast popups on loop launch ("Orchestrator Fired") and completion, with per-project naming
 - **Anomaly response** — detects stuck/spinning/stagnation, terminates current loop, revises instructions, relaunches
+
+### `/orchestrator-multi` Command (Multi-Agent)
+- **Parallel execution** — launches N independent `loop_driver.py --agent-id` processes with isolated workspaces
+- **5-phase lifecycle** — Planning → Launching → Monitoring → Merge → Reporting
+- **Dropbox-safe file locking** — write-wait-verify protocol handles sync delay; TTL-based crash recovery
+- **File manifests** — each agent gets `assigned_files.txt` for fast-path ownership checks
+- **PreToolUse hook enforcement** — `acquire_file_lock.py` blocks agents from modifying files assigned to other agents
+- **Dashboard generation** — markdown table showing per-agent status, cost, turns, locks
 
 ### Observability
 - **Trace logging** — JSONL trace with auto-rotation at 10MB
@@ -142,6 +152,7 @@ python loop_driver.py --project . --json-log --verbose
 | `--no-stagnation-check` | off | Disable diminishing returns detection |
 | `--skip-preflight` | off | Skip CLI preflight verification |
 | `--config` | auto | Path to config.json |
+| `--agent-id` | none | Agent ID for multi-agent mode (e.g., `agent-1`) |
 
 ### Running Multiple Projects
 
@@ -155,7 +166,7 @@ python loop_driver.py --project ~/projects/backend --model sonnet --verbose
 python loop_driver.py --project ~/projects/frontend --model sonnet --verbose
 ```
 
-Never run two loops targeting the same project — they share `.workflow/state.json` and will corrupt state.
+Never run two loops targeting the same project — they share `.workflow/state.json` and will corrupt state. For parallel work within a single project, use the `/orchestrator-multi` command instead.
 
 ## Configuration
 
@@ -214,6 +225,8 @@ automated claude/
 ├── state_tracker.py      # State persistence + budget enforcement
 ├── config.py             # Pydantic config models
 ├── log_redactor.py       # API key scrubbing
+├── file_locking.py       # Dropbox-safe file locks for multi-agent
+├── multi_agent.py        # Multi-agent orchestration
 ├── requirements.txt      # pydantic, pytest
 ├── CLAUDE.md             # Project instructions for the loop
 ├── tests/
@@ -223,13 +236,23 @@ automated claude/
 │   ├── test_state_tracker.py
 │   ├── test_config.py
 │   ├── test_log_redactor.py
+│   ├── test_file_locking.py
+│   ├── test_multi_agent.py
 │   ├── test_integration.py
 │   ├── helpers.py
 │   └── conftest.py
-└── .workflow/             # Per-project runtime state (gitignored)
-    ├── state.json
-    ├── trace.jsonl
-    └── metrics_summary.json
+├── .workflow/             # Per-project runtime state (gitignored)
+│   ├── state.json
+│   ├── trace.jsonl
+│   └── metrics_summary.json
+└── .agents/              # Multi-agent workspaces (gitignored)
+    ├── agent-1/
+    │   ├── CLAUDE.md
+    │   ├── assigned_files.txt
+    │   └── .workflow/
+    ├── agent-2/ ...
+    └── shared/
+        └── global_locks.json
 ```
 
 ## The `/orchestrator` Command
@@ -266,6 +289,60 @@ The orchestrator manages **exactly one `loop_driver.py` process** at a time:
 
 The command definition lives in `~/.claude/commands/orchestrator.md` and the agent definition in `~/.claude/agents/orchestrator.md`.
 
+## The `/orchestrator-multi` Command
+
+For projects with independent modules that can be worked on in parallel, `/orchestrator-multi` launches N agents with isolated workspaces and Dropbox-safe file locking.
+
+### Multi-Agent Lifecycle
+
+```
+/orchestrator-multi <project-path> "<task>" --agents 3
+       │
+       ▼
+ Phase A: PLANNING    → Analyze project, split files across agents
+ Phase B: LAUNCHING   → Create .agents/ workspaces, spawn N loop_driver.py processes
+ Phase C: MONITORING  → Poll all agents' state.json, generate dashboard
+ Phase D: MERGE       → Release locks, run build/test, check conflicts
+ Phase E: REPORTING   → Aggregate costs, per-agent summary
+```
+
+### File Locking Protocol
+
+Agents coordinate via a shared `global_locks.json` using a **write-wait-verify** protocol designed for Dropbox sync:
+
+1. Agent writes its lock entry to the JSON file
+2. Waits for the configured sync delay (default 5s)
+3. Re-reads the file — if the lock persists, it's acquired; if clobbered by another agent, retries
+
+Expired locks (default TTL: 30 minutes) are cleaned automatically, providing crash recovery.
+
+### Agent Isolation
+
+Each agent gets a scoped workspace under `.agents/`:
+- **`CLAUDE.md`** — instructions scoped to that agent's assigned files
+- **`assigned_files.txt`** — fast-path manifest for the PreToolUse hook
+- **`.workflow/`** — isolated state, trace, and metrics
+
+A PreToolUse hook (`acquire_file_lock.py`) enforces file ownership at the tool level. When an agent tries to Edit or Write a file, the hook checks the manifest and lock registry — if the file belongs to another agent, the tool call is blocked.
+
+### Multi-Agent Configuration
+
+Add to `.workflow/config.json`:
+
+```json
+{
+  "multi_agent": {
+    "enabled": true,
+    "max_agents": 4,
+    "dropbox_sync_delay_seconds": 5.0,
+    "lock_retry_attempts": 5,
+    "lock_ttl_seconds": 1800,
+    "dashboard_refresh_seconds": 30,
+    "merge_timeout_seconds": 600
+  }
+}
+```
+
 ## Deploying to Other Projects
 
 This directory **is** the toolkit. To automate any project:
@@ -276,10 +353,12 @@ This directory **is** the toolkit. To automate any project:
 
 The loop reads the target's `CLAUDE.md`, spawns Claude Code pointing at that directory, and manages the iteration lifecycle. Your target project needs no dependencies on this toolkit.
 
+Both `/orchestrator` and `/orchestrator-multi` can be run from **any directory** — they accept a target project path and manage everything remotely. State, traces, and agent workspaces all live inside the target project's directory.
+
 ## Testing
 
 ```bash
-pytest tests/ -v  # 220 tests
+pytest tests/ -v  # 377 tests
 ```
 
 ## License

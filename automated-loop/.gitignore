@@ -9,6 +9,8 @@ memory/
 .workflow/trace*.jsonl
 .workflow/orchestrator-mode.json
 .workflow/post_review.md
+.workflow/multi-agent-*.md
+.agents/
 __pycache__/
 *.pyc
 .pytest_cache/

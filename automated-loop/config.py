@@ -210,6 +210,28 @@ class StagnationConfig(BaseModel):
     )
 
 
+class FileLockEntry(BaseModel):
+    """A single file lock held by an agent."""
+
+    owner: str  # "agent-1", "agent-2", etc.
+    acquired_at: str  # ISO-8601 timestamp
+    ttl_seconds: int = Field(default=1800, ge=60, le=7200)
+
+
+class MultiAgentConfig(BaseModel):
+    """Configuration for multi-agent parallel orchestration."""
+
+    enabled: bool = False
+    max_agents: int = Field(default=4, ge=1, le=8)
+    dropbox_sync_delay_seconds: float = Field(default=5.0, ge=0.0, le=15.0)
+    lock_retry_attempts: int = Field(default=5, ge=1, le=20)
+    lock_retry_delay_seconds: float = Field(default=10.0, ge=0.0, le=60.0)
+    lock_ttl_seconds: int = Field(default=1800, ge=60, le=7200)
+    dashboard_refresh_seconds: int = Field(default=30, ge=10, le=300)
+    merge_timeout_seconds: int = Field(default=600, ge=60, le=3600)
+    agent_state_dir: str = ".agents"
+
+
 class WorkflowConfig(BaseModel):
     """Root configuration model for .workflow/config.json."""
 
@@ -225,6 +247,7 @@ class WorkflowConfig(BaseModel):
     verification: VerificationConfig = Field(default_factory=VerificationConfig)
     exploration: ExplorationConfig = Field(default_factory=ExplorationConfig)
     post_review: PostReviewConfig = Field(default_factory=PostReviewConfig)
+    multi_agent: MultiAgentConfig = Field(default_factory=MultiAgentConfig)
 
 
 def load_config(config_path: str | Path) -> Result[WorkflowConfig]:
