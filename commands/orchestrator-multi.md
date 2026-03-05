@@ -5,15 +5,20 @@
 ## Usage
 
 ```
-/orchestrator-multi <project-path> "<task-description>" [--agents N]
+/orchestrator-multi                                        # Auto-discover from cwd + BLUEPRINT.md
+/orchestrator-multi <project-path> "<task-description>" [--agents N]  # Explicit mode
+/orchestrator-multi status                                 # Show running agent progress
+/orchestrator-multi off                                    # Tear down running session
 ```
 
 **Arguments**: `$ARGUMENTS`
 
-**Parse rules:**
-- If `$ARGUMENTS` starts with a path → use that project + remaining text as task
-- `--agents N` → number of parallel agents (default: 2, max: 4)
-- If `$ARGUMENTS` is empty → use cwd, ask user for task
+**Parse rules (checked in order):**
+1. `status` → show status of running agents (commits, iterations, state)
+2. `off` → tear down running multi-agent session (remove worktrees, delete branches)
+3. If `$ARGUMENTS` starts with a path → use that project + remaining text as task
+4. `--agents N` → number of parallel agents (default: auto, max: 4)
+5. If `$ARGUMENTS` is empty → **Auto-Discovery Mode** (Phase 0)
 
 ---
 
@@ -35,6 +40,78 @@ This orchestrator uses **git worktrees** — not `.agents/` subdirectories, not 
 
 ---
 
+## Phase 0: AUTO-DISCOVERY (when `$ARGUMENTS` is empty)
+
+**Skip this phase if explicit arguments were provided.** When the user runs `/orchestrator-multi` with no arguments, auto-detect project context and generate the orchestration plan.
+
+### Path A: BLUEPRINT.md Exists
+
+1. **Detect project root:**
+   ```bash
+   git rev-parse --show-toplevel
+   ```
+
+2. **Find and parse BLUEPRINT.md** in the project root:
+   - Look for numbered phase headings: `## Phase N:`, `### Phase N:`, `N.`, or `- Phase N:`
+   - Extract from each phase: title, description, and file scope (directories/files referenced)
+   - If phases reference specific files/directories, record those as the phase's territory
+
+3. **Auto-split phases into agent territories:**
+   - Group phases by file overlap — phases touching the same directories belong to the same agent
+   - Default: **2 agents**, split roughly evenly by phase count
+   - If phases are highly independent (zero file overlap), allow up to **3 agents**
+   - Phases with dependencies (Phase B requires Phase A output) go to the **same agent** in sequence
+
+4. **Auto-detect shared files** (files referenced by 2+ phases):
+   - Headers, configs, type definitions → always FORBIDDEN for agents
+   - Append-only data files → agents can ADD but not REMOVE entries
+   - Build scripts, CI configs → FORBIDDEN
+
+5. **Auto-detect build command:**
+   - `Makefile` → `make`
+   - `package.json` → `npm run build` or `npm test`
+   - `pyproject.toml` / `setup.py` → `python -m build` or `pytest`
+   - `Cargo.toml` → `cargo build`
+   - Read project's `CLAUDE.md` for explicit build instructions (overrides auto-detect)
+
+6. **Generate task description** from parsed phases and territory map
+
+7. **Proceed to Phase A** with auto-generated territory map, phase assignments, and shared file list
+
+### Path B: No BLUEPRINT.md (Fresh Project)
+
+1. **Detect project root:**
+   ```bash
+   git rev-parse --show-toplevel
+   ```
+
+2. **Gather project context:** Read `README.md`, `CLAUDE.md`, `docs/`, `specs/`, `package.json`, `pyproject.toml`, and recent git history
+
+3. **Run `/research-perplexity`** with prompt:
+   ```
+   Analyze this project and create a phased implementation blueprint.
+   Based on the codebase structure and any available docs, identify:
+   1. What modules/features need to be built or completed
+   2. Dependencies between them
+   3. Logical phase groupings for parallel development (2-3 agents)
+   4. Shared files that should be orchestrator-managed (not modified by agents)
+   Output as a structured BLUEPRINT.md with numbered phases, each containing:
+   - Phase title and description
+   - Files/directories in scope
+   - Dependencies on other phases
+   - Acceptance criteria
+   ```
+
+4. **Write the generated BLUEPRINT.md** to project root
+
+5. **Present to user for review:** "Generated BLUEPRINT.md with N phases. Please review and confirm, or edit before proceeding."
+
+6. **Once approved**, follow **Path A** above
+
+**Fallback:** If `/research-perplexity` fails or the project is too ambiguous, fall back to asking the user for a task description (original behavior).
+
+---
+
 ## Phase A: PLANNING
 
 **Metacognitive checkpoint: "I must NOT read or write target source code. I write CLAUDE.md files and launch loops."**
@@ -48,6 +125,12 @@ This orchestrator uses **git worktrees** — not `.agents/` subdirectories, not 
 
 ### Step 2: Analyze Work Split
 
+**If Phase 0 (Auto-Discovery) already ran:**
+- Use the auto-generated territory map, phase assignments, and shared file list
+- Review the auto-generated plan for correctness
+- Present to user for confirmation before proceeding
+
+**If running with explicit arguments (Phase 0 did not run):**
 Read the project's `CLAUDE.md`, `BLUEPRINT.md`, `README.md`, and recent git history to understand what needs to be built. Then:
 
 1. **Identify independent modules** — directories, features, or phases that can be worked on in parallel without file conflicts
@@ -377,6 +460,66 @@ Report to user:
 3. **Build status**: Pass/fail after merge
 4. **Remaining work**: Any phases not completed
 5. **Suggestions**: Next steps, `/research-perplexity` for strategic analysis
+
+---
+
+## Subcommands
+
+### `status` — Show Running Agent Progress
+
+```
+/orchestrator-multi status
+```
+
+1. Read `.workflow/multi-agent-launch.json` from the project root (cwd or detected via `git rev-parse --show-toplevel`)
+2. For each agent, gather:
+   - Branch name and worktree path
+   - Latest commit: `git -C <worktree> log --oneline -1`
+   - Total commits since launch: `git -C <worktree> log --oneline <base-branch>..HEAD | wc -l`
+   - Iteration count from `<worktree>/.workflow/state.json`
+   - Running/stopped: check if `task_id` process is still alive (use `TaskOutput` with `block=false`)
+3. Display as a formatted table:
+
+```
+Multi-Agent Status — <project-name>
+Launched: <timestamp>
+
+| Agent | Branch | Commits | Iteration | Status | Latest Commit |
+|-------|--------|---------|-----------|--------|---------------|
+| 1 | agent-1-<slug> | 12 | 24/50 | Running | feat(routes): Phase 5 complete |
+| 2 | agent-2-<slug> | 8 | 18/50 | Running | feat(trainers): add Gym 3 data |
+```
+
+4. If no `.workflow/multi-agent-launch.json` found, report: "No active multi-agent session found in this project."
+
+### `off` — Tear Down Running Session
+
+```
+/orchestrator-multi off
+```
+
+1. Read `.workflow/multi-agent-launch.json` from the project root
+2. Present what will be torn down and **ask user to confirm**:
+   ```
+   Tear down multi-agent session?
+   - Agent 1: agent-1-<slug> @ C:\worktrees\agent-1 (12 commits)
+   - Agent 2: agent-2-<slug> @ C:\worktrees\agent-2 (8 commits)
+
+   ⚠️  Unmerged commits will remain on agent branches but worktrees will be removed.
+   Proceed? [y/n]
+   ```
+3. On confirmation, for each agent:
+   - Stop background task if running (use `TaskStop`)
+   - Remove worktree: `git worktree remove <path> --force`
+   - Optionally delete branch: `git branch -d <branch-name>` (only if already merged; use `-D` only if user explicitly confirms)
+4. Remove `.workflow/multi-agent-launch.json`
+5. Report cleanup summary:
+   ```
+   Teardown complete:
+   - Stopped 2 running agents
+   - Removed 2 worktrees
+   - Branches retained: agent-1-<slug>, agent-2-<slug> (unmerged — delete manually with `git branch -D`)
+   ```
 
 ---
 
