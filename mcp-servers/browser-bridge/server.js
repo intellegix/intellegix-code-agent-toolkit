@@ -52,7 +52,7 @@ function execFileAsync(command, args, options) {
         error.stderr = stderr;
         reject(error);
       } else {
-        resolve(stdout);
+        resolve({ stdout, stderr });
       }
     });
   });
@@ -922,18 +922,34 @@ class BrowserBridgeServer {
 
         // Browser/auto modes need longer timeout; research/labs modes need even more
         const timeout = isLabs ? CONFIG.timeouts.councilLabs : isResearch ? CONFIG.timeouts.councilResearch : (mode === 'browser' || mode === 'auto') ? CONFIG.timeouts.councilBrowser : CONFIG.timeouts.councilApi;
-        const result = await execFileAsync('python', scriptArgs, {
+        let raw = await execFileAsync('python', scriptArgs, {
           timeout,
           encoding: 'utf-8',
           env: pythonEnv,
           cwd: scriptDir,
         });
+        let result = raw.stdout;
         // Check for browser busy error (concurrent session holding the profile lock)
         if (result.includes('BROWSER_BUSY')) {
           return {
             error: 'Another browser council/research session is active. Wait ~2 min or use --mode api.',
             code: 'BROWSER_BUSY',
           };
+        }
+        // Retry once if stdout is empty (Bug 3: empty synthesis)
+        if (!result || !result.trim()) {
+          log.warn('research_empty_result', { stderr: (raw.stderr || '').substring(0, 500) });
+          await new Promise(r => setTimeout(r, 3000));
+          raw = await execFileAsync('python', scriptArgs, {
+            timeout,
+            encoding: 'utf-8',
+            env: pythonEnv,
+            cwd: scriptDir,
+          });
+          result = raw.stdout;
+          if (!result || !result.trim()) {
+            log.warn('research_empty_result_retry', { stderr: (raw.stderr || '').substring(0, 500) });
+          }
         }
         return { synthesis: result };
       }
@@ -1127,7 +1143,7 @@ class BrowserBridgeServer {
             const scriptDir = join(homedir(), '.claude', 'council-automation');
             const pythonEnv = { ...process.env, PYTHONIOENCODING: 'utf-8' };
             const validatorInput = JSON.stringify({ response: responseText, task });
-            const validatorOutput = await execFileAsync('python', [
+            const validatorRaw = await execFileAsync('python', [
               join(scriptDir, 'response_validator.py'),
               '--json', validatorInput,
             ], {
@@ -1136,7 +1152,7 @@ class BrowserBridgeServer {
               env: pythonEnv,
               cwd: scriptDir,
             });
-            const validatorResult = JSON.parse(validatorOutput);
+            const validatorResult = JSON.parse(validatorRaw.stdout);
             validated = validatorResult.valid;
             violations = validatorResult.violations || [];
             sanitizedResponse = validatorResult.sanitized_response || responseText;

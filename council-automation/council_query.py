@@ -655,6 +655,16 @@ async def run_browser_query(
     finally:
         await council.stop()
 
+    # Diagnostic: warn if browser returned no synthesis (Bug 3 investigation)
+    if not browser_result.get("error") and not browser_result.get("synthesis"):
+        print(
+            f"WARNING: browser_result has no synthesis. "
+            f"Keys: {list(browser_result.keys())}, "
+            f"models: {len(browser_result.get('models', {}))}, "
+            f"step: {browser_result.get('step', 'N/A')}",
+            file=sys.stderr,
+        )
+
     if browser_result.get("error"):
         error_results = {
             "query": query,
@@ -1018,7 +1028,21 @@ def main() -> None:
     else:
         results = asyncio.run(run_api_query(args.query, context))
 
-    print(format_synthesis_output(results))
+    output = format_synthesis_output(results)
+    if not output or not output.strip():
+        print(
+            f"WARNING: format_synthesis_output returned empty. "
+            f"Mode: {results.get('mode')}, "
+            f"error: {results.get('error')}, "
+            f"synthesis keys: {list(results.get('synthesis', {}).keys())}",
+            file=sys.stderr,
+        )
+        output = (
+            "# Research/Council Query — Empty Output\n\n"
+            "The query completed but produced no formatted output.\n"
+            f"Check `~/.claude/council-cache/council_latest.json` for raw data.\n"
+        )
+    print(output)
 
 
 if __name__ == "__main__":

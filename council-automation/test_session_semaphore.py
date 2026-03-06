@@ -201,6 +201,20 @@ def test_stealth_scripts():
     assert "__playwright" in scripts
 
 
+def test_no_spawned_pids_attr():
+    """PerplexityCouncil no longer tracks _spawned_pids (cross-session kill fix)."""
+    council = PerplexityCouncil()
+    assert not hasattr(council, "_spawned_pids"), \
+        "_spawned_pids was removed to fix cross-session Chrome kill bug"
+
+
+def test_no_get_chrome_pids_function():
+    """_get_chrome_pids function is removed from the module."""
+    import council_browser
+    assert not hasattr(council_browser, "_get_chrome_pids"), \
+        "_get_chrome_pids was removed — inherently racy PID delta tracking"
+
+
 # Standalone runner
 if __name__ == "__main__":
     tests = [
@@ -213,6 +227,8 @@ if __name__ == "__main__":
         test_build_storage_state,
         test_build_storage_state_legacy,
         test_stealth_scripts,
+        test_no_spawned_pids_attr,
+        test_no_get_chrome_pids_function,
     ]
     passed = 0
     failed = 0

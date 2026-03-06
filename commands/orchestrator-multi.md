@@ -317,16 +317,47 @@ Key reminders:
 - `--no-stagnation-check` — Phases are large; prevent false stagnation triggers
 - `--verbose` — Full NDJSON event logging for debugging
 
-### Step 2: Launch All Agents
+### Step 2: Pre-Launch Validation
 
-Launch each agent as a **background process** using the Bash tool with `run_in_background: true`. Record the task IDs.
+Before launching, verify the work split has **zero file overlap** between agents:
 
+1. Compare the `ALLOWED FILES` sections across all agent CLAUDE.md files
+2. If ANY file or glob pattern appears in two or more agent territories → **STOP and re-split**
+3. This eliminates TOCTOU race conditions in `global_locks.json` by ensuring agents never contend for the same lock
+
+### Step 3: Launch Agents (Staggered)
+
+Launch each agent as a **background process** using the Bash tool with `run_in_background: true`. **Stagger launches by 5-10 seconds** to reduce lock contention on `global_locks.json`:
+
+```bash
+# Launch agent 1
+# ... record task_id
+# Wait 5-10 seconds before next launch
+sleep 8
+# Launch agent 2
+# ... record task_id
+```
+
+**Why stagger:** `global_locks.json` uses a write-wait-verify protocol, but simultaneous launches create a brief window where two agents could read-read-write-write (TOCTOU race). A 5-10s stagger makes this effectively impossible with non-overlapping file territories.
+
+Record the task IDs:
 ```
 Agent 1: task_id = <id1>
 Agent 2: task_id = <id2>
 ```
 
-### Step 3: Log Launch
+### Step 4: Post-Launch Lock Verification
+
+After all agents are launched, verify no lock conflicts:
+
+```bash
+cat <project-root>/.agents/shared/global_locks.json
+```
+
+- If any file has two owners → **kill the later agent**, release its locks, relaunch
+- If `lock_ttl_seconds` (default 1800s/30min) < expected task duration → warn user to increase TTL in `.workflow/config.json`
+
+### Step 5: Log Launch
 
 Write to `.workflow/multi-agent-launch.json` in the main project:
 
@@ -373,6 +404,19 @@ cat C:\worktrees\agent-2\.workflow\state.json
 # Use TaskOutput tool with block=false for non-blocking check
 ```
 
+### Agent Liveness Decision Tree
+
+On each monitoring check, classify each agent's state:
+
+| State | Detection | Action |
+|-------|-----------|--------|
+| **Healthy** | Process alive (`poll()` returns None) + new commits since last check | Continue monitoring |
+| **Stuck** | Process alive + same iteration for 3+ consecutive checks + no new commits | Warn user. Read `state.json` and last stderr for build errors. Consider killing and relaunching with a more targeted prompt. |
+| **Crashed** | Process dead (`poll()` returns non-None) + incomplete work (completion gate not all `[x]`) | Release agent's locks from `global_locks.json`. Report partial progress (which phases completed). Ask user: relaunch or merge partial work? |
+| **At Risk (TTL)** | Process alive + agent running >25 minutes (approaching 30min lock TTL default) | Warn user that locks may expire. If other agents are waiting on locked files, suggest increasing `lock_ttl_seconds` in config and relaunching. |
+
+**Stuck vs Slow:** An agent that's making progress (new file changes in `git diff`) but not committing isn't stuck — it may be mid-phase. Only flag as stuck if `git diff --stat` in the worktree also shows no changes for 3+ checks.
+
 ### Decision Gates
 
 | Signal | Action |
@@ -383,6 +427,30 @@ cat C:\worktrees\agent-2\.workflow\state.json
 | Budget exceeded | Report cost, ask user to increase or stop |
 | Agent modifying forbidden files | Should not happen (CLAUDE.md prohibits it). If it does, `git checkout -- <file>` to revert. |
 | Shared header request | Run **Phase D.5 Auto-Resolution Loop** — auto-apply blocking requests, copy to worktrees, update status. See Phase D.5 for full procedure. |
+
+### Cost Projection Dashboard
+
+In addition to the status table, include cost projections during monitoring:
+
+```
+Cost Projection — <timestamp>
+
+| Agent | Iterations | Cost So Far | $/Iteration | Projected Total | Flag |
+|-------|-----------|-------------|-------------|-----------------|------|
+| 1     | 12/50     | $8.40       | $0.70       | ~$35.00         |      |
+| 2     | 8/50      | $12.80      | $1.60       | ~$80.00         | HIGH |
+| Total |           | $21.20      |             | ~$115.00        | WARN |
+```
+
+**Calculation:**
+1. `$/Iteration` = `Cost So Far` / `Iterations Completed`
+2. `Projected Total` = `$/Iteration` * `max_iterations_per_agent`
+3. **HIGH flag**: Agent's `$/Iteration` exceeds 2x the average across all agents
+4. **WARN flag**: Total projected cost > 80% of total budget (`max_cost_per_agent` * `num_agents`)
+
+**Actions on flags:**
+- **HIGH**: Report to user — agent may be in a retry loop (builds failing, tests failing). Check its `state.json` for error patterns.
+- **WARN (80% budget)**: Alert user proactively. Suggest: reduce `max_iterations`, intervene on expensive agent, or increase budget.
 
 ### Handling Shared Header Requests
 
@@ -482,37 +550,68 @@ cd C:\worktrees\agent-2 && git log --oneline <base-branch>..HEAD
 
 Review each agent's commits. Check that CLAUDE.md completion gates are marked done.
 
-### Step 2: Merge Agent 1 into Base
+### Step 2: Create Rollback Point
+
+**Before any merge**, tag the current HEAD as a rollback point:
+
+```bash
+cd <project-root>
+git tag pre-merge-rollback HEAD
+```
+
+This enables clean recovery if the merged result fails tests.
+
+### Step 3: Merge Agent 1 into Base
 
 ```bash
 cd <project-root>
 git merge --no-ff agent-1-<slug> -m "merge: Agent 1 <scope>"
 ```
 
-### Step 3: Merge Agent 2
+### Step 4: Merge Agent 2
 
 ```bash
 git merge --no-ff agent-2-<slug> -m "merge: Agent 2 <scope>"
 ```
 
-### Step 4: Resolve Conflicts
+### Step 5: Resolve Conflicts
 
 **Expected conflict patterns:**
 - **Append-only files** (trainers.json, package.json dependencies): Append Agent 2's additions after Agent 1's
 - **Constant/enum headers** (trainers.h, constants.ts): Append Agent 2's constants after Agent 1's
 - **No other conflicts expected** if territory was properly scoped
 
-### Step 5: Verify Combined Build
+### Step 6: Verify Combined Build + Tests
 
 ```bash
 cd <project-root>
 <clean-command>
 <build-command>
+<test-command>
 ```
 
-### Step 6: Clean Up
+### Step 7: Rollback on Failure
+
+If tests or build fail after merge:
+
+1. **Reset to rollback point:**
+   ```bash
+   git reset --hard pre-merge-rollback
+   ```
+
+2. **Diagnose which agent's changes caused the failure:**
+   - Merge Agent 1 alone → run tests → if pass, Agent 2 is the problem
+   - Merge Agent 2 alone → run tests → if pass, Agent 1 is the problem
+   - If both pass individually but fail together → integration conflict between agents
+
+3. **Report findings** to user with specific test failures and which agent's commits introduced them
+
+4. **Re-attempt** after fixing: either fix the failing agent's branch in its worktree and re-merge, or ask user for guidance
+
+### Step 8: Clean Up (only after successful merge)
 
 ```bash
+git tag -d pre-merge-rollback
 git worktree remove C:\worktrees\agent-1
 git worktree remove C:\worktrees\agent-2
 git branch -d agent-1-<slug>

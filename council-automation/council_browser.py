@@ -20,7 +20,6 @@ import time
 from pathlib import Path
 
 import shutil
-import subprocess
 import tempfile
 
 from council_config import (
@@ -257,27 +256,6 @@ def _load_selectors() -> dict:
     }
 
 
-def _get_chrome_pids() -> set[int]:
-    """Get all chrome.exe PIDs on Windows. Returns empty set on other platforms."""
-    if sys.platform != 'win32':
-        return set()
-    try:
-        out = subprocess.run(
-            ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, timeout=5,
-        )
-        pids = set()
-        for line in out.stdout.strip().split('\n'):
-            parts = line.split(',')
-            if len(parts) >= 2:
-                try:
-                    pids.add(int(parts[1].strip('"')))
-                except ValueError:
-                    pass
-        return pids
-    except Exception:
-        return set()
-
 
 class PerplexityCouncil:
     """Autonomous Playwright-based Perplexity automation.
@@ -319,7 +297,6 @@ class PerplexityCouncil:
         self._artifact_count = 0
         self._artifact_dir: Path | None = None
         self._temp_profile_dir: str | None = None  # Cloudflare fallback temp dir
-        self._spawned_pids: set[int] = set()  # Chrome PIDs we launched (for force-kill)
 
     def _init_artifact_dir(self, query: str) -> None:
         """Create run artifact directory based on timestamp + query slug."""
@@ -560,7 +537,6 @@ class PerplexityCouncil:
         """
         self._temp_profile_dir = tempfile.mkdtemp(prefix="council_np_")
         _log(f"Non-persistent: using isolated profile {self._temp_profile_dir}")
-        pids_before = _get_chrome_pids() if not self.headless else set()
 
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._temp_profile_dir,
@@ -576,13 +552,9 @@ class PerplexityCouncil:
         # Apply stealth scripts
         await self.context.add_init_script(self._stealth_scripts())
 
-        if not self.headless:
-            self._spawned_pids |= (_get_chrome_pids() - pids_before)
-
     async def _start_persistent(self) -> None:
         """Launch with persistent context (used for --save-session only)."""
         BROWSER_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        pids_before = _get_chrome_pids() if not self.headless else set()
 
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_USER_DATA_DIR),
@@ -597,9 +569,6 @@ class PerplexityCouncil:
 
         await self.context.add_init_script(self._stealth_scripts())
 
-        if not self.headless:
-            self._spawned_pids |= (_get_chrome_pids() - pids_before)
-
     async def _start_with_temp_profile(self) -> None:
         """Cloudflare fallback: persistent context with a temp profile directory.
 
@@ -608,7 +577,6 @@ class PerplexityCouncil:
         """
         self._temp_profile_dir = tempfile.mkdtemp(prefix="council_cf_")
         _log(f"Cloudflare fallback: using temp profile {self._temp_profile_dir}")
-        pids_before = _get_chrome_pids() if not self.headless else set()
 
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._temp_profile_dir,
@@ -622,9 +590,6 @@ class PerplexityCouncil:
             await self._load_session()
 
         await self.context.add_init_script(self._stealth_scripts())
-
-        if not self.headless:
-            self._spawned_pids |= (_get_chrome_pids() - pids_before)
 
     async def _load_session(self) -> None:
         """Load session from playwright-session.json + playwright-localstorage.json."""
@@ -2001,25 +1966,6 @@ class PerplexityCouncil:
                 await self.playwright.stop()
             except Exception:
                 pass
-        # Force-kill Chrome processes we spawned if they survived graceful close
-        if self._spawned_pids:
-            await asyncio.sleep(1)  # Grace period for process exit
-            for pid in list(self._spawned_pids):
-                try:
-                    os.kill(pid, 0)  # Check if still alive
-                    _log(f"Chrome PID {pid} still alive after graceful close, force-killing...")
-                    if sys.platform == 'win32':
-                        subprocess.run(
-                            ['taskkill', '/F', '/PID', str(pid), '/T'],
-                            capture_output=True, timeout=5,
-                        )
-                    else:
-                        os.kill(pid, 9)  # SIGKILL
-                except (OSError, SystemError):
-                    pass  # Already dead
-                except Exception as e:
-                    _log(f"WARNING: Failed to kill Chrome PID {pid}: {e}")
-            self._spawned_pids.clear()
         # Clean up temp profile dir (Cloudflare fallback)
         if self._temp_profile_dir and Path(self._temp_profile_dir).exists():
             try:

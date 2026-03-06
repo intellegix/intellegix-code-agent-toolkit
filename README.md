@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
 [![Node.js 18+](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org)
-[![Tests: 220](https://img.shields.io/badge/Tests-220-brightgreen.svg)](automated-loop/tests/)
+[![Tests: 377](https://img.shields.io/badge/Tests-377-brightgreen.svg)](automated-loop/tests/)
 
 A modular configuration system for Claude Code CLI. Includes an automated loop driver, multi-agent parallel orchestration via git worktrees, custom slash commands, multi-model council automation, MCP browser bridge, and portfolio governance.
 
@@ -11,7 +11,7 @@ A modular configuration system for Claude Code CLI. Includes an automated loop d
 
 - **Automated Loop Driver** - Run Claude Code in autonomous loops with session continuity, budget enforcement, stagnation detection, and model-aware scaling (Sonnet recommended — near Opus quality at lower cost)
 - **Multi-Agent Parallel Orchestration** - Split large projects across 2-4 parallel agents using git worktrees with territory-based conflict prevention, shared header management, and sequential merge
-- **Custom Slash Commands** - 16+ reusable commands for research, planning, code review, and deployment workflows
+- **Custom Slash Commands** - 18 reusable commands for research, planning, code review, and deployment workflows
 - **Council Automation** - Multi-model queries via Perplexity (GPT, Claude, Gemini) with Opus synthesis
 - **MCP Browser Bridge** - Chrome extension bridge for browser automation through Claude Code
 - **Portfolio Governance** - Project tier system with phase restrictions and complexity budgets
@@ -35,7 +35,7 @@ A modular configuration system for Claude Code CLI. Includes an automated loop d
 │   ├── state_tracker.py       # Workflow state persistence + budget
 │   ├── log_redactor.py        # API key scrubbing from logs
 │   ├── loop_driver.ps1        # PowerShell wrapper
-│   └── tests/                 # 220 pytest tests
+│   └── tests/                 # 377 pytest tests
 │
 ├── agents/                    # Agent definitions (Task tool subagent types)
 │   ├── orchestrator.md        # Single-loop orchestrator agent
@@ -56,14 +56,18 @@ A modular configuration system for Claude Code CLI. Includes an automated loop d
 │   ├── orchestrator.md        # Single-loop task orchestration
 │   ├── orchestrator-multi.md  # Multi-agent parallel orchestration (git worktrees)
 │   ├── research-perplexity.md # Deep research via Perplexity
+│   ├── labs-perplexity.md     # Experimental labs via Perplexity
+│   ├── creative-research.md   # 3-stage creative feature discovery
 │   ├── smart-plan.md          # Multi-phase project planning
 │   ├── council-refine.md      # Multi-model plan refinement
+│   ├── council-extract.md     # Extract council response to markdown
 │   ├── export-to-council.md   # Export session for council review
+│   ├── automate-perplexity.md # Unified Perplexity automation
 │   ├── fix-issue.md           # GitHub issue resolution
 │   ├── implement.md           # Feature implementation
 │   ├── review.md              # Code review
 │   ├── handoff.md             # Agent handoff
-│   └── ...                    # 15+ commands total
+│   └── ...                    # 18 commands total
 │
 ├── council-automation/        # Multi-model council system
 │   ├── council_browser.py     # Playwright-based Perplexity automation
@@ -297,11 +301,12 @@ The loop never modifies `CLAUDE.md` itself — the human retains full editorial 
 
 **Concurrent Perplexity Research Queries**
 
-Concurrent research queries now work in most cases, thanks to a 3-layer fix:
+Concurrent research queries work reliably, thanks to a multi-layer isolation approach:
 
-- **Process cleanup** (`council_browser.py`): Snapshots Chrome PIDs before/after browser launch. After `playwright.stop()`, any surviving `chrome.exe` processes are force-killed after a 1-second grace period, preventing orphaned instances from blocking subsequent queries.
+- **Playwright-managed cleanup** (`council_browser.py`): Browser lifecycle is handled entirely by Playwright's built-in process management (`context.close()` → `playwright.stop()`). No manual PID tracking — previous PID-delta tracking was removed because it caused a cross-session kill bug where one session could force-kill another's Chrome processes.
 - **Profile isolation**: Each browser session gets a unique temp user-data-dir (`tempfile.mkdtemp(prefix="council_np_")`), eliminating Chrome `SingletonLock` conflicts. Node.js subprocess calls use `execFileAsync` for non-blocking concurrent execution.
 - **DevTools protocol coordination**: `/research-perplexity`, `/labs-perplexity`, and `/export-to-council` commands include a mandatory "Close Browser Bridge Sessions" step before launching Playwright, preventing DevTools Protocol collisions between browser-bridge and Playwright.
+- **Empty result diagnostics**: The MCP server captures stderr from Python subprocesses and retries once (after 3s) if stdout is empty, with diagnostic logging for debugging.
 
 The `SessionSemaphore` limits concurrency to 3 browser slots. Very high concurrency (4+ simultaneous queries) may still hit Perplexity's own session limits when using the same account.
 
@@ -453,14 +458,19 @@ Place in `~/.claude/commands/` and invoke from Claude Code with `/<command-name>
 | Command | Description |
 |---------|-------------|
 | `/research-perplexity` | Deep research via Perplexity browser automation |
+| `/labs-perplexity` | Experimental labs query via Perplexity |
+| `/creative-research` | 3-stage creative feature discovery (ideation → viability → blueprints) |
 | `/smart-plan` | Multi-phase project planning |
 | `/council-refine` | Multi-model plan refinement with Opus synthesis |
+| `/council-extract` | Extract model council response to markdown |
 | `/export-to-council` | Export session context for council review |
+| `/automate-perplexity` | Unified Perplexity automation (standard/research/labs) |
 | `/fix-issue` | GitHub issue investigation and resolution |
 | `/implement` | Feature implementation workflow |
 | `/review` | Code review workflow |
 | `/handoff` | Agent-to-agent handoff documentation |
 | `/portfolio-status` | Portfolio-wide project status review |
+| `/ensure-space` | Add current Perplexity thread to a project Space |
 | `/cache-perplexity-session` | Refresh Perplexity browser session cookies |
 | `/orchestrator` | Single-loop task orchestration with role enforcement |
 | `/orchestrator-multi` | Multi-agent parallel orchestration using git worktrees |
