@@ -2541,8 +2541,13 @@ def main() -> int:
     artifact_body, _ = read_artifact(workdir)
 
     # Pre-flight oversize warning. INTERIM PENDING PHASE 4 CALIBRATION — threshold
-    # 16 KB matches the new ~20 KB per-pass cap (5000 tokens). Original 18 KB was
-    # paired with the 3500-token cap.
+    # kept at 16 KB after the 7ee00ea revert (ARTIFACT_TEXT_TOKEN_CAP 5000 -> 3500,
+    # i.e. artifact text now caps at ~14 KB / prompts at ~19 KB max). 16 KB is
+    # intentionally conservative: it warns just above the ~14 KB truncation point
+    # so users see the notice *before* pass-level truncation silently drops
+    # coverage, while staying below the empirical ~18 KB browser-UI render cliff.
+    # (Prior comment claimed this paired with the 5000-token cap; that cap no
+    # longer exists. Whether to relax to 18 KB defers to the issue #44 20-run gate.)
     _artifact_size_kb = len(artifact_body) / 1024
     if _artifact_size_kb > 16:
         log(
