@@ -33,6 +33,8 @@ unlinks it before attempting acquire.
 """
 from __future__ import annotations
 
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -95,3 +97,74 @@ def get_submit_lock(timeout: float | None = None) -> FileLock:
     # With thread_local=False, the counter is shared across threads in the
     # process and release correctly closes the fd / releases the OS lock.
     return FileLock(str(LOCK_PATH), timeout=timeout, thread_local=False)
+
+
+HEARTBEAT_INTERVAL_S = 60.0  # default mtime-refresh cadence for long holds
+
+
+class LockHeartbeat:
+    """Background thread that periodically refreshes a held lock file's mtime.
+
+    The stale-reclaim check in `get_submit_lock()` treats any lock file
+    older than `STALE_AGE_S` (180s) as abandoned by a crashed holder and
+    unlinks it so a new caller can proceed. That assumption is correct
+    for the lock's original design (10-25s submit-window holds), but
+    breaks if a caller legitimately holds the lock for minutes (e.g. the
+    RESEARCH_QUEUE_STOPGAP whole-run widening in council_browser.py) --
+    a second session would reclaim and acquire the "stale" lock out from
+    under a still-running holder, causing the exact overlap the widening
+    was meant to prevent.
+
+    LockHeartbeat only opts a caller INTO this behavior when explicitly
+    started (see `start_lock_heartbeat`); nothing here runs unless a
+    caller creates one. A live holder's heartbeat thread keeps touching
+    the lock file's mtime every `interval_s`, so `age > STALE_AGE_S`
+    never trips while the holder is alive. If the holder process
+    crashes, its heartbeat thread dies with it -- the mtime stops
+    advancing, ages past `STALE_AGE_S`, and the existing reclaim logic
+    in `get_submit_lock()` fires exactly as it does today.
+    """
+
+    def __init__(self, lock_path: Path, interval_s: float = HEARTBEAT_INTERVAL_S) -> None:
+        self._lock_path = lock_path
+        self._interval_s = interval_s
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="submit-lock-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        # wait() returns True only when stop_event is set before the
+        # timeout elapses, so this loop refreshes mtime once per
+        # interval and exits promptly (no extra sleep) once stopped.
+        while not self._stop_event.wait(self._interval_s):
+            try:
+                os.utime(self._lock_path, None)
+            except OSError:
+                # Lock file briefly missing/replaced -- best-effort only;
+                # the next tick will retry.
+                pass
+
+    def stop(self) -> None:
+        """Signal the heartbeat thread to stop and wait for it to exit."""
+        self._stop_event.set()
+        self._thread.join(timeout=5.0)
+
+
+def start_lock_heartbeat(
+    lock: FileLock, interval_s: float = HEARTBEAT_INTERVAL_S
+) -> LockHeartbeat:
+    """Start a background heartbeat that keeps `lock`'s file mtime fresh.
+
+    Only call this for a lock intended to be held far longer than
+    `STALE_AGE_S` (180s) -- e.g. under RESEARCH_QUEUE_STOPGAP, where
+    submit_lock spans a whole Perplexity run instead of just the submit
+    window. Callers MUST call `.stop()` on the returned LockHeartbeat
+    once the lock is released (or before releasing it) so the thread
+    doesn't keep touching a file the caller no longer owns.
+
+    Not called anywhere by default -- opt-in only, so default (no
+    heartbeat) behavior is unaffected.
+    """
+    return LockHeartbeat(Path(lock.lock_file), interval_s=interval_s)

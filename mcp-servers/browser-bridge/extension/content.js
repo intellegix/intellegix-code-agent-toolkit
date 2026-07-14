@@ -103,6 +103,8 @@ async function handleAction(msg) {
       return actionInsertText(msg.selector, msg.text, msg.append);
     case 'waitForStable':
       return actionWaitForStable(msg.selector, msg.stableMs, msg.timeout, msg.pollInterval);
+    case 'autoScrollLoad':
+      return actionAutoScrollLoad(msg);
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -248,6 +250,95 @@ async function actionGetPageContent() {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Auto-scroll loader — drives viewport-gated infinite-scroll / lazy content
+// ---------------------------------------------------------------------------
+//
+// Scrolls a container (or the page) to the bottom in jittered increments until
+// the amount of loaded content stops growing, then reports how much loaded.
+//
+// IMPORTANT: IntersectionObserver / lazy hydration only fire when the tab is
+// actually foregrounded (Chrome throttles background tabs and pauses paint).
+// The background service worker foregrounds the target tab before invoking this
+// action and restores the prior tab afterwards (see handleLoadDynamic).
+
+async function actionAutoScrollLoad(msg) {
+  const containerSelector = msg.containerSelector || null;
+  const itemSelector = msg.itemSelector || null;
+  const maxScrolls = Math.max(1, Math.min(500, msg.maxScrolls || 60));
+  const stableMs = Math.max(200, Math.min(20000, msg.stableMs || 1200));
+  const minDelay = Math.max(100, Math.min(10000, msg.minDelay || 600));
+  const maxDelay = Math.max(minDelay, Math.min(20000, msg.maxDelay || 1400));
+  const timeout = Math.max(2000, Math.min(600000, msg.timeout || 90000));
+  const stagnantLimit = 3;
+
+  // Resolve the scroll target. When a container selector is given but not yet
+  // present, wait briefly for it (lazy layouts mount it after hydration).
+  let scrollTarget = null;
+  if (containerSelector) {
+    scrollTarget = await window.claudeHelpers.findElement(containerSelector, 5000);
+    if (!scrollTarget) {
+      return { success: false, error: `Scroll container not found: ${containerSelector}`, code: 'CONTAINER_NOT_FOUND' };
+    }
+  }
+
+  const measure = () => {
+    if (itemSelector) return document.querySelectorAll(itemSelector).length;
+    return scrollTarget
+      ? scrollTarget.scrollHeight
+      : (document.scrollingElement || document.documentElement).scrollHeight;
+  };
+
+  const scrollToBottom = () => {
+    if (scrollTarget) {
+      scrollTarget.scrollTo({ top: scrollTarget.scrollHeight, behavior: 'instant' });
+    } else {
+      const el = document.scrollingElement || document.documentElement;
+      window.scrollTo({ top: el.scrollHeight, behavior: 'instant' });
+    }
+  };
+
+  const startTime = Date.now();
+  let prev = -1;
+  let stagnant = 0;
+  let scrolls = 0;
+  let timedOut = false;
+
+  for (let i = 0; i < maxScrolls; i++) {
+    if (Date.now() - startTime >= timeout) { timedOut = true; break; }
+
+    scrollToBottom();
+    scrolls++;
+
+    // Jittered, human-ish pause so lazy content can load between steps.
+    const delay = Math.round(minDelay + Math.random() * (maxDelay - minDelay));
+    await sleep(delay);
+
+    const current = measure();
+    if (current <= prev) stagnant++;
+    else stagnant = 0;
+    prev = current;
+
+    // Content stopped growing for several consecutive steps — fully loaded.
+    if (stagnant >= stagnantLimit) break;
+  }
+
+  // Best-effort settle wait so the final batch finishes rendering before extraction.
+  if (itemSelector || containerSelector) {
+    await sleep(Math.min(stableMs, 2000));
+  }
+
+  return {
+    success: true,
+    loaded: itemSelector ? document.querySelectorAll(itemSelector).length : prev,
+    metric: itemSelector ? 'itemCount' : 'scrollHeight',
+    scrolls,
+    stagnant,
+    timedOut,
+    elapsed: Date.now() - startTime,
+  };
 }
 
 // ---------------------------------------------------------------------------
