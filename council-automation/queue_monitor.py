@@ -27,7 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -47,6 +49,10 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_PATH: Path = research_queue.SNAPSHOT
 ACTIVITY_LOG_PATH: Path = research_queue.ACTIVITY_LOG
 LOG_WORKDIR: Path = Path.home() / ".claude" / "council-logs" / "queue-monitor"
+# Daemon stdio sink: when run under pythonw.exe by Task Scheduler (--daemon),
+# fds 1/2 are redirected here so the otherwise-discarded poll table + logging
+# output stay diagnosable. Mirrors browser_bridge_keeper._harden_for_windows_daemon.
+LOG_PATH: Path = Path.home() / ".claude" / "logs" / "queue_monitor.log"
 
 # --------------------------------------------------------------------------
 # Thresholds (monkeypatchable module globals -- see evaluate()).
@@ -448,6 +454,34 @@ def _maybe_self_heal(alerts: Sequence[Alert], last_fired_ts: float) -> float:
 # --------------------------------------------------------------------------
 # Poll loop
 # --------------------------------------------------------------------------
+def _harden_for_windows_daemon() -> None:
+    """Redirect fds 1/2 to LOG_PATH so pythonw Task Scheduler runs are diagnosable.
+
+    Called from main() ONLY for --daemon (persistent background service), so an
+    interactive `python queue_monitor.py` run still prints its table to the
+    console. Mirrors browser_bridge_keeper._harden_for_windows_daemon.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = os.open(str(LOG_PATH), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(log_fd, 1)
+        os.dup2(log_fd, 2)
+        os.close(log_fd)
+        sys.stdout = os.fdopen(1, "w", buffering=1)
+        sys.stderr = os.fdopen(2, "w", buffering=1)
+    except (OSError, ValueError):
+        pass
+    for sig_name in ("SIGBREAK", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
+
+
 def run_loop(interval_s: float = 10.0, once: bool = False, use_pushover: bool = True) -> None:
     """Poll SNAPSHOT_PATH/ACTIVITY_LOG_PATH, evaluate, print, and notify.
 
@@ -511,7 +545,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Perform a single evaluation pass and exit.")
     parser.add_argument("--no-pushover", action="store_true",
                         help="Disable Pushover notifications (still prints + logs).")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Persistent background service mode: redirect stdout/stderr "
+                             "to LOG_PATH (~/.claude/logs/queue_monitor.log) so a pythonw "
+                             "Task Scheduler run stays diagnosable. Implies looping.")
     args = parser.parse_args(argv)
+
+    if args.daemon:
+        _harden_for_windows_daemon()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run_loop(interval_s=args.interval, once=args.once, use_pushover=not args.no_pushover)
