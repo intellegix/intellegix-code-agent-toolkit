@@ -63,7 +63,27 @@ from council_config import (
     VISION_POLL_INTERVAL_SYNTHESIS,
 )
 
-from submission_lock import get_submit_lock
+import research_queue
+from submission_lock import get_submit_lock, start_lock_heartbeat
+
+# Env flag values (case-insensitive) treated as "enabled". A bare
+# `os.environ.get(...)` truthiness check would treat FLAG=0/FLAG=false
+# as enabled too (any non-empty string is truthy) -- _flag_enabled()
+# normalizes that footgun for every RESEARCH_QUEUE_* flag read below.
+_TRUTHY_FLAG_VALUES = {"1", "true", "yes", "on"}
+
+
+def _flag_enabled(env_var: str) -> bool:
+    """Return True only if `env_var` is set to a recognized truthy value.
+
+    Recognized truthy values (case-insensitive): "1", "true", "yes",
+    "on". Unset, empty, or any other value (including "0"/"false") is
+    treated as disabled.
+    """
+    value = os.environ.get(env_var)
+    if value is None:
+        return False
+    return value.strip().lower() in _TRUTHY_FLAG_VALUES
 
 
 class BrowserBusyError(Exception):
@@ -392,6 +412,14 @@ def _is_reasoning_trail_only(text: str) -> bool:
     )
 
 
+# A synthesis at/above this length is treated as a complete answer, never a
+# failure worth flagging: the truncation heuristic (rule (d)) is unreliable at
+# this size (reasoning-trail-inflated .prose peak). Chosen from the empirical
+# 197-vs-6379-char gap (Jul 12-14): 8x above the failure ceiling, ~2200-char
+# buffer below the smallest known-good output. Perplexity-verified 2026-07-14.
+SUBSTANTIAL_SYNTHESIS_CHARS = 2500
+
+
 def _validate_result(text: str, peak_len: int | None = None) -> str:
     """Post-extraction semantic-completeness check (Perplexity #4, 2026-06-15).
 
@@ -416,10 +444,21 @@ def _validate_result(text: str, peak_len: int | None = None) -> str:
     s = (text or "").strip()
     if not s:
         return "empty"
-    # (d) length regression vs streaming peak.
-    if isinstance(peak_len, (int, float)) and peak_len >= 100:
-        if (peak_len - len(s)) / peak_len > 0.15:
-            return "suspect_truncated"
+    # (d) length regression vs streaming peak — GATED to non-substantial outputs.
+    # On large structured answers the streaming .prose peak is inflated by
+    # transient reasoning-trail text that collapses on final extraction, so a
+    # COMPLETE 6-13K-char answer trips the >15% regression check. Empirically
+    # (Jul 12-14 instrumentation) this was the SOLE false-positive source: every
+    # false "truncated" flag was on an output >=6000 chars, while every genuine
+    # near-empty failure was <300 chars. Gate (d) below SUBSTANTIAL_SYNTHESIS_CHARS
+    # so it still catches truncation of short/medium answers (where the .prose
+    # peak is a reliable baseline). Rules (a)/(b) stay UNCONDITIONAL so a
+    # structural cut mid-fence / mid-token is still caught at any size
+    # (per Perplexity plan-verification 2026-07-14).
+    if len(s) < SUBSTANTIAL_SYNTHESIS_CHARS:
+        if isinstance(peak_len, (int, float)) and peak_len >= 100:
+            if (peak_len - len(s)) / peak_len > 0.15:
+                return "suspect_truncated"
     # (a) unclosed code fence.
     if s.count("```") % 2 == 1:
         return "suspect_truncated"
@@ -1045,6 +1084,9 @@ class PerplexityCouncil:
         freshness = self._check_session_freshness(self.session_path)
         if hasattr(self, "_query_inst"):
             self._query_inst["cookies_stale_critical"] = freshness.get("stale_critical", [])
+            # Pre-guard min critical-cookie TTL — the value the guard decided on,
+            # which is what lets calibration tune SESSION_FRESHNESS_THRESHOLD_S.
+            self._query_inst["min_critical_ttl_s"] = freshness.get("min_critical_ttl_s")
         stale = freshness.get("stale_critical") or []
         soon = freshness.get("expiring_soon") or []
         if not stale and not soon:
@@ -1338,15 +1380,52 @@ class PerplexityCouncil:
         critical section. `FileLock.acquire` is blocking; we offload to a
         worker thread so the asyncio event loop keeps pumping (network IO,
         timer callbacks) while we wait our turn.
+
+        Under RESEARCH_QUEUE_STOPGAP (see `run()`), submit_lock is held
+        for the whole run (minutes, not the ~10-25s submit window this
+        lock was designed for). Two adjustments only apply under that
+        flag: (1) acquire with a long timeout (RESEARCH_QUEUE_MAX_WAIT,
+        default 1200s) so a waiting session queues instead of erroring
+        out on the short default timeout; (2) start a background
+        heartbeat that refreshes the lock file's mtime so the 180s
+        stale-reclaim in `get_submit_lock()` never mistakes a live
+        long-held lock for a crashed one. Default (flag unset) behavior
+        is unchanged -- default timeout, no heartbeat.
         """
-        lock = get_submit_lock()
+        stopgap = _flag_enabled("RESEARCH_QUEUE_STOPGAP")
+        timeout = None
+        if stopgap:
+            try:
+                timeout = float(os.environ.get("RESEARCH_QUEUE_MAX_WAIT", "1200"))
+            except ValueError:
+                timeout = 1200.0
+        lock = get_submit_lock(timeout=timeout)
         _log(
             f"submit_lock waiting timeout_s={lock.timeout:.0f} "
             f"path={lock.lock_file}"
         )
         await asyncio.to_thread(lock.acquire)
         _log(f"submit_lock acquired path={lock.lock_file}")
+        if stopgap:
+            self._submit_lock_heartbeat = start_lock_heartbeat(lock)
+            _log("submit_lock heartbeat started (RESEARCH_QUEUE_STOPGAP)")
         return lock
+
+    def _stop_submit_lock_heartbeat(self) -> None:
+        """Stop and clear the submit-lock heartbeat thread, if running.
+
+        Idempotent and safe to call unconditionally: when
+        RESEARCH_QUEUE_STOPGAP is unset (default), the heartbeat is
+        never started, `self._submit_lock_heartbeat` stays unset/None,
+        and this is a silent no-op.
+        """
+        heartbeat = getattr(self, "_submit_lock_heartbeat", None)
+        if heartbeat is not None:
+            try:
+                heartbeat.stop()
+            except Exception:
+                pass
+            self._submit_lock_heartbeat = None
 
     async def activate_mode(self, page) -> bool:
         """Activate the configured Perplexity mode via slash command.
@@ -2849,7 +2928,70 @@ class PerplexityCouncil:
             self._browser = None
 
     async def run(self, query: str) -> dict:
-        """Full pipeline: semaphore -> start -> validate -> query -> wait -> extract."""
+        """Full pipeline, FIFO-serialized: research_queue slot -> semaphore ->
+        start -> validate -> query -> wait -> extract.
+
+        The research_queue slot is the OUTERMOST layer -- it wraps the
+        entire existing pipeline in `_run_impl` (semaphore, Chrome
+        launch, submit_lock, extract), so acquisition order is always
+        queue -> submit_lock, never reversed, and at most one run()
+        across ALL concurrent Claude Code sessions is ever inside
+        `_run_impl` at a time.
+
+        `acquire_slot()` is a SYNC context manager whose __enter__ blocks
+        in a poll-wait loop (up to research_queue.MAX_WAIT_S) -- entered
+        and exited via `asyncio.to_thread` (same pattern as
+        `_acquire_submit_lock`'s `asyncio.to_thread(lock.acquire)`) so a
+        waiting run() never blocks this process's asyncio event loop.
+
+        Kill switch: `RESEARCH_QUEUE_ENABLED=0` makes `acquire_slot()` a
+        true no-op (see research_queue.py) -- `run()` then behaves
+        byte-for-byte as it did before this wiring (no ticket/log/
+        snapshot files, no serialization).
+
+        `_run_impl` swallows almost all failures internally and returns
+        an `{"error": ...}` dict rather than raising (see its own
+        `except Exception` block), so a real exception essentially never
+        reaches this wrapper. To make the central
+        `perplexity-activity.jsonl` record "error" (not "completed") for
+        those logical failures too, a synthetic exc_info is passed into
+        `slot_cm.__exit__` when the result dict carries an "error" key --
+        this is NOT re-raised; run()'s external contract (always returns
+        a dict, never raises for expected failures) is unchanged.
+        """
+        session_id = f"{Path.cwd().name}:{os.getpid()}"
+        slot_cm = research_queue.acquire_slot(
+            session=session_id, query_preview=query, mode=self.perplexity_mode
+        )
+        slot = await asyncio.to_thread(slot_cm.__enter__)
+        self._run_id = slot.get("run_id")
+
+        _exc_info: tuple = (None, None, None)
+        try:
+            result = await self._run_impl(query)
+            if isinstance(result, dict) and result.get("error"):
+                _exc_info = (
+                    RuntimeError,
+                    RuntimeError(str(result.get("error"))[:200]),
+                    None,
+                )
+            return result
+        except BaseException as e:
+            _exc_info = (type(e), e, e.__traceback__)
+            raise
+        finally:
+            await asyncio.to_thread(lambda: slot_cm.__exit__(*_exc_info))
+
+    async def _run_impl(self, query: str) -> dict:
+        """Full pipeline: semaphore -> start -> validate -> query -> wait -> extract.
+
+        Called only from `run()`, which wraps this entire method in the
+        research_queue FIFO slot. `self._run_id` (stamped by `run()`
+        before this method starts) is threaded into `self._query_inst`
+        and the returned `results` dict below, so
+        `instrumentation-query.jsonl` / `runs.jsonl` share the same
+        run_id used in the central `perplexity-activity.jsonl`.
+        """
         start_time = time.time()
         self._init_artifact_dir(query)
         self._semaphore = SessionSemaphore()
@@ -2862,6 +3004,7 @@ class PerplexityCouncil:
         # emit happens at every exit path (early returns + bottom finally).
         self._query_inst: dict = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "run_id": getattr(self, "_run_id", None),
             "query_chars": len(query) if query else 0,
             "perplexity_mode": getattr(self, "perplexity_mode", None),
             "chrome_path_used": None,
@@ -2874,6 +3017,8 @@ class PerplexityCouncil:
             "extracted_synthesis_chars": 0,
             "peak_prose_chars": 0,
             "result_validation": "ok",
+            "min_critical_ttl_s": None,   # pre-guard min critical-cookie TTL (calibration #3)
+            "elapsed_wall_s": None,       # submit->final wall time (calibration #3)
             "exit_reason": None,
             "inst_emitted": False,
         }
@@ -2979,7 +3124,12 @@ class PerplexityCouncil:
                 # that was causing "browsers close each other out".
                 # Release happens immediately after submit_query returns so
                 # wait_for_completion + extract_results run OUTSIDE the lock
-                # (fully parallel across sessions).
+                # (fully parallel across sessions) -- THIS IS THE DEFAULT
+                # (RESEARCH_QUEUE_STOPGAP unset) BEHAVIOR ONLY. Under
+                # RESEARCH_QUEUE_STOPGAP, that early release is skipped
+                # (see the guard below) and submit_lock stays held all the
+                # way through wait_for_completion + extract_results,
+                # released only in the outer `finally`.
                 _log(f"Activating {self.perplexity_mode} mode...")
                 if not await self.activate_mode(page):
                     await self._save_artifact(page, "activate_failure")
@@ -2992,12 +3142,26 @@ class PerplexityCouncil:
                 # appeared inside submit_query). Defensive release in the
                 # outer finally covers any exception path that bypasses
                 # this explicit release.
-                try:
-                    submit_lock.release()
-                    submit_lock_released = True
-                    _log("submit_lock released")
-                except Exception as e:
-                    _log(f"submit_lock release error={e!r}")
+                #
+                # Phase 0 stopgap (RESEARCH_QUEUE_STOPGAP): when set, skip
+                # this early release so submit_lock stays held for the
+                # WHOLE run — the existing defensive release in the outer
+                # `finally` below (guarded by `submit_lock_released`)
+                # becomes the sole release point, serializing entire runs
+                # instead of just the submit window. Default (flag unset)
+                # behavior is unchanged.
+                if not _flag_enabled("RESEARCH_QUEUE_STOPGAP"):
+                    try:
+                        submit_lock.release()
+                        submit_lock_released = True
+                        _log("submit_lock released")
+                    except Exception as e:
+                        _log(f"submit_lock release error={e!r}")
+                    finally:
+                        # No-op when the flag is off (heartbeat is only
+                        # ever started under RESEARCH_QUEUE_STOPGAP in
+                        # _acquire_submit_lock), kept here for symmetry.
+                        self._stop_submit_lock_heartbeat()
 
                 _log("Waiting for completion...")
                 completed = await self.wait_for_completion(page, self.timeout)
@@ -3013,6 +3177,7 @@ class PerplexityCouncil:
                 results["mode"] = "browser"
                 results["completed"] = completed
                 results["execution_time_ms"] = elapsed
+                results["run_id"] = getattr(self, "_run_id", None)
                 _log(f"Done in {elapsed/1000:.1f}s")
 
                 return results
@@ -3056,6 +3221,14 @@ class PerplexityCouncil:
                     _log("submit_lock released (defensive)")
                 except Exception:
                     pass
+                finally:
+                    # Under RESEARCH_QUEUE_STOPGAP this is the ONLY
+                    # release point (the mid-run release above is
+                    # skipped under the flag), so it must also be where
+                    # the heartbeat thread started in
+                    # _acquire_submit_lock() gets stopped. No-op when
+                    # the flag is off / heartbeat was never started.
+                    self._stop_submit_lock_heartbeat()
             # Phase 3 (2026-05-29): emit per-query instrumentation once per
             # run() invocation regardless of exit path (normal return, raised
             # exception, mid-pipeline failure). Idempotent via _query_inst_emitted.
@@ -3063,6 +3236,7 @@ class PerplexityCouncil:
                 try:
                     if self._query_inst.get("exit_reason") is None:
                         self._query_inst["exit_reason"] = "completed"
+                    self._query_inst["elapsed_wall_s"] = round(time.time() - start_time, 1)
                     _emit_query_instrumentation(self._query_inst)
                     self._query_inst_emitted = True
                 except Exception:

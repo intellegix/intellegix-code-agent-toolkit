@@ -235,6 +235,20 @@ function connect() {
     reconnectDelay = RECONNECT_BASE;
     lastServerMessage = Date.now();
 
+    // Identify this client so the server can pick a single canonical target when
+    // more than one Chrome has the extension (e.g. the user's personal profile
+    // AND the always-on keeper Chrome). The keeper's copy carries "(Keeper)" in
+    // its manifest name; everything else reports role 'default'. Absence of this
+    // message (older extension builds) is treated as 'default' server-side, so
+    // this is fully backward-compatible.
+    try {
+      const mf = chrome.runtime.getManifest();
+      const role = (mf.name || '').includes('Keeper') ? 'keeper' : 'default';
+      ws.send(JSON.stringify({ type: 'hello', role, clientId: chrome.runtime.id, version: mf.version }));
+    } catch (e) {
+      // non-fatal — server defaults missing role to 'default'
+    }
+
     // Layer 1: periodic ping
     clearInterval(pingTimer);
     pingTimer = setInterval(() => {
@@ -308,6 +322,9 @@ async function handleServerMessage(msg) {
         break;
       case 'navigate':
         result = await handleNavigate(msg.payload);
+        break;
+      case 'load_dynamic':
+        result = await handleLoadDynamic(msg.payload);
         break;
       case 'get_context':
         result = await handleGetContext(msg.payload);
@@ -424,9 +441,116 @@ async function getTargetTabId(payload) {
   return tab ? tab.id : null;
 }
 
+// ---------------------------------------------------------------------------
+// Dynamic content loader — foreground the tab, scroll lazy content, restore
+// ---------------------------------------------------------------------------
+//
+// Facebook (and similar hardened sites) gate infinite-scroll content behind
+// IntersectionObserver + lazy hydration. Chrome throttles BACKGROUND tabs —
+// paint is paused and IntersectionObserver callbacks (bound to the frame
+// rendering pipeline) never fire — so lazy lists never populate in the tabs the
+// bridge opens with { active: false }. CDP visibility-spoofing does NOT flip
+// document.visibilityState to 'visible', so the only reliable fix is to briefly
+// FOREGROUND the tab, scroll, then restore the user's prior tab/window.
+
+/**
+ * Run `fn` with `tabId` foregrounded (active + its window focused), then restore
+ * whatever tab/window was active before. Always restores, even if `fn` throws.
+ */
+async function withForegroundTab(tabId, fn) {
+  let prevTabId = null;
+  let prevWindowId = null;
+  try {
+    const [prev] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (prev) {
+      prevTabId = prev.id;
+      prevWindowId = prev.windowId;
+    }
+  } catch { /* best-effort — restore is optional */ }
+
+  const target = await chrome.tabs.get(tabId);
+  try {
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(target.windowId, { focused: true });
+    return await fn();
+  } finally {
+    // Restore the user's context only if it differs from the target tab.
+    if (prevTabId && prevTabId !== tabId) {
+      await chrome.tabs.update(prevTabId, { active: true }).catch(() => {});
+      if (prevWindowId) {
+        await chrome.windows.update(prevWindowId, { focused: true }).catch(() => {});
+      }
+    }
+  }
+}
+
+/**
+ * Navigate to (or reuse) a page, foreground it, and auto-scroll to force
+ * viewport-gated lazy content to load, then restore the user's prior tab.
+ */
+async function handleLoadDynamic(payload) {
+  // 1. Resolve the target tab — navigate first if a URL was supplied.
+  let tabId;
+  let url = payload.url || null;
+  if (url) {
+    const nav = await handleNavigate(payload);
+    tabId = nav.tabId;
+    url = nav.url || url;
+  } else {
+    tabId = await getTargetTabId(payload);
+  }
+  if (!tabId) throw new Error('No target tab for load_dynamic');
+
+  // 2. Ensure the content script is present (same probe as handleActionRequest).
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => typeof window.claudeHelpers !== 'undefined',
+    });
+  } catch {
+    throw new Error('Cannot access this page (restricted URL)');
+  }
+
+  // 3. Foreground the tab so IntersectionObserver / lazy hydration actually run,
+  //    scroll the lazy list to completion, then restore the prior tab/window.
+  const scrollResult = await withForegroundTab(tabId, async () => {
+    if (payload.waitForSelector) {
+      await chrome.tabs.sendMessage(tabId, {
+        source: 'claude-bridge',
+        action: 'waitForElement',
+        selector: payload.waitForSelector,
+        timeout: 15000,
+      }).catch(() => {});
+    }
+    return chrome.tabs.sendMessage(tabId, {
+      source: 'claude-bridge',
+      action: 'autoScrollLoad',
+      containerSelector: payload.containerSelector,
+      itemSelector: payload.itemSelector,
+      maxScrolls: payload.maxScrolls,
+      stableMs: payload.stableMs,
+      minDelay: payload.minDelay,
+      maxDelay: payload.maxDelay,
+      timeout: payload.timeout,
+    });
+  });
+
+  return { ...(scrollResult || {}), tabId, url };
+}
+
 async function handleActionRequest(payload) {
   const tabId = await getTargetTabId(payload);
   if (!tabId) throw new Error('No active tab found');
+
+  // Trusted directional scroll: JS window.scrollBy() produces isTrusted:false
+  // wheel/scroll events, which hardened infinite-scroll sites (Facebook friends
+  // list, etc.) ignore — the scrollbar moves but no lazy content loads. Route
+  // directional scrolls through CDP Input.dispatchMouseEvent(mouseWheel) so they
+  // arrive as trusted input and trigger lazy-load exactly like a human wheel.
+  // Selector-based scroll (scrollIntoView) still goes to the content script.
+  if (payload.action === 'scroll' && !payload.selector) {
+    return cdpWheelScroll(tabId, payload);
+  }
 
   // Inject content script if not already present
   try {
@@ -445,6 +569,76 @@ async function handleActionRequest(payload) {
   });
 
   return response;
+}
+
+// ---------------------------------------------------------------------------
+// Trusted wheel scroll via CDP
+// ---------------------------------------------------------------------------
+//
+// JS window.scrollBy/scrollTo and new WheelEvent() are isTrusted:false. Hardened
+// infinite-scroll (Facebook friends list, feeds, etc.) only fetches the next
+// batch in response to a TRUSTED input event, so JS scrolling moves the scrollbar
+// but never loads more content. CDP Input.dispatchMouseEvent(mouseWheel) events
+// go through Chrome's real input pipeline (isTrusted:true) — the same mechanism
+// Playwright's mouse.wheel() uses — so the page reacts as if a human scrolled.
+async function cdpWheelScroll(tabId, payload) {
+  const amount = Math.max(1, Math.min(30000, payload.amount || 500));
+  const dir = payload.direction || 'down';
+  // [deltaY sign, deltaX sign] — CDP mouseWheel: +deltaY scrolls DOWN.
+  const sign = { up: [-1, 0], down: [1, 0], left: [0, -1], right: [0, 1] };
+  const [vy, vx] = sign[dir] || [1, 0];
+
+  // Hardened sites (Facebook, feeds) pause IntersectionObserver / lazy hydration
+  // on hidden/background tabs, so a trusted wheel loads nothing while the tab is
+  // in the background. Foreground the tab (and focus its window) first so the
+  // scroll actually triggers content loading. Best-effort — never block on it.
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && !tab.active) await chrome.tabs.update(tabId, { active: true });
+    if (tab && tab.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+    }
+  } catch {
+    // tab may be gone; the cdpCommand calls below will surface a clear error
+  }
+
+  // Wheel events must originate from a point over the scrollable content.
+  // Resolve the viewport center via CDP Runtime.evaluate (defaults if it fails).
+  let x = 400;
+  let y = 400;
+  try {
+    const vp = await cdpCommand(tabId, 'Runtime.evaluate', {
+      expression: 'JSON.stringify({w:innerWidth,h:innerHeight})',
+      returnByValue: true,
+    });
+    const dims = JSON.parse(vp?.result?.value || '{}');
+    if (dims.w) x = Math.round(dims.w / 2);
+    if (dims.h) y = Math.round(dims.h / 2);
+  } catch {
+    // fall back to default coordinates
+  }
+
+  // Position the pointer first — some wheel handlers require a prior mouseMoved.
+  await cdpCommand(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+
+  // Real wheel gestures arrive as a burst of small deltas; emulate that so the
+  // page's scroll / IntersectionObserver logic fires the same as a human scroll.
+  const TICK = 120;
+  const ticks = Math.max(1, Math.round(amount / TICK));
+  let sent = 0;
+  for (let i = 0; i < ticks; i++) {
+    await cdpCommand(tabId, 'Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x,
+      y,
+      deltaX: vx * TICK,
+      deltaY: vy * TICK,
+    });
+    sent += TICK;
+    await new Promise((r) => setTimeout(r, 16)); // ~1 frame between ticks
+  }
+
+  return { success: true, direction: dir, amount: sent, trusted: true, via: 'cdp-mouseWheel' };
 }
 
 async function handleNavigate(payload) {

@@ -22,7 +22,7 @@ import {
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { WebSocket } from 'ws';
-import { writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve as pathResolve } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync, execFile } from 'node:child_process';
@@ -133,6 +133,22 @@ class BrowserBridgeServer {
               tabId: { type: 'number', description: 'Tab to navigate (uses active tab if omitted)' },
             },
             required: ['url'],
+          },
+        },
+        {
+          name: 'browser_load_dynamic',
+          description: 'Load viewport-gated infinite-scroll / lazy content (e.g. Facebook friends lists, feeds, search results) that will NOT render in a background tab. Briefly foregrounds the target tab, auto-scrolls until the list stops growing, then restores your previously-active tab/window. Optionally navigates first (pass url). After this returns, use browser_extract_data to read the hydrated content. CAUTION: on logged-in personal accounts, sites like Facebook detect automated traversal behaviorally — repeated/rapid list scraping risks security checkpoints or account lockout; use deliberately and sparingly.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'URL to navigate to first (omit to scroll the current tab)' },
+              tabId: { type: 'number', description: 'Target tab ID (uses session/active tab if omitted)' },
+              containerSelector: { type: 'string', description: 'CSS selector of the scrollable container (omit to scroll the whole page)' },
+              itemSelector: { type: 'string', description: 'CSS selector of the repeated list items — used to detect when loading is complete (falls back to scroll height)' },
+              waitForSelector: { type: 'string', description: 'CSS selector to wait for before scrolling (e.g. the list container)' },
+              maxScrolls: { type: 'number', description: 'Max scroll iterations (default 60, max 500)', default: 60 },
+              stableMs: { type: 'number', description: 'Settle time in ms after loading stops (default 1200)', default: 1200 },
+            },
           },
         },
         {
@@ -504,6 +520,14 @@ class BrowserBridgeServer {
             required: ['task'],
           },
         },
+        {
+          name: 'research_queue_status',
+          description: 'Return the live Perplexity research FIFO queue snapshot (active run, ordered queue with positions, recent runs, stats) so a session can see cross-session serialization state. Reads ~/.claude/council-logs/perplexity-queue.json.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
       ],
     }));
 
@@ -577,6 +601,23 @@ class BrowserBridgeServer {
           type: 'navigate',
           payload: this._withSession({ url, tabId }),
         });
+      }
+
+      case 'browser_load_dynamic': {
+        const url = args.url ? Validator.url(args.url) : undefined;
+        const tabId = Validator.tabId(args.tabId);
+        const containerSelector = args.containerSelector ? Validator.selector(args.containerSelector) : undefined;
+        const itemSelector = args.itemSelector ? Validator.selector(args.itemSelector) : undefined;
+        const waitForSelector = args.waitForSelector ? Validator.selector(args.waitForSelector) : undefined;
+        const maxScrolls = args.maxScrolls !== undefined ? Validator.timeout(args.maxScrolls, 1, 500, 60) : undefined;
+        const stableMs = args.stableMs !== undefined ? Validator.timeout(args.stableMs, 200, 20_000, 1200) : undefined;
+        return this.bridge.broadcast(
+          {
+            type: 'load_dynamic',
+            payload: this._withSession({ url, tabId, containerSelector, itemSelector, waitForSelector, maxScrolls, stableMs }),
+          },
+          CONFIG.timeouts.fullPage,
+        );
       }
 
       case 'browser_get_context': {
@@ -1212,6 +1253,20 @@ class BrowserBridgeServer {
           elapsed_ms: elapsed,
           timedOut: waitResult?.timedOut || false,
         };
+      }
+
+      case 'research_queue_status': {
+        const queuePath = join(homedir(), '.claude', 'council-logs', 'perplexity-queue.json');
+        try {
+          if (!existsSync(queuePath)) {
+            return { empty: true, note: 'No research has run through the queue yet (perplexity-queue.json not found).' };
+          }
+          const raw = readFileSync(queuePath, 'utf-8');
+          return JSON.parse(raw);
+        } catch (queueErr) {
+          log.warn('research_queue_status_failed', { error: queueErr.message });
+          return { error: 'snapshot temporarily unavailable, retry' };
+        }
       }
 
       default:

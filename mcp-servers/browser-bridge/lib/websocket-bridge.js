@@ -48,7 +48,7 @@ export class WebSocketBridge extends EventEmitter {
 
   _onConnection(ws) {
     const clientId = randomUUID();
-    this.browserClients.set(ws, { id: clientId, lastPing: Date.now(), lastAppMsg: Date.now(), connectedAt: Date.now() });
+    this.browserClients.set(ws, { id: clientId, lastPing: Date.now(), lastAppMsg: Date.now(), connectedAt: Date.now(), role: 'default' });
 
     // Send connection init
     this._send(ws, { type: 'connection_init', clientId, serverVersion: '1.0.0' });
@@ -99,6 +99,20 @@ export class WebSocketBridge extends EventEmitter {
     if (info) {
       info.lastPing = Date.now();
       info.lastAppMsg = Date.now();
+    }
+
+    // Browser client identification — record role so we can pick a single
+    // canonical target when more than one Chrome has the extension (e.g. the
+    // user's personal profile AND the always-on keeper). Backward-compatible:
+    // clients that never send 'hello' keep the default role.
+    if (msg.type === 'hello') {
+      const bi = this.browserClients.get(ws);
+      if (bi) {
+        bi.role = msg.role === 'keeper' ? 'keeper' : 'default';
+        if (msg.clientId) bi.clientId = msg.clientId;
+      }
+      log.info('browser_hello', { clientId: bi?.id, role: bi?.role, browsers: this.browserClients.size });
+      return;
     }
 
     // Handle relay client identification — move from browserClients to relayClients
@@ -155,9 +169,14 @@ export class WebSocketBridge extends EventEmitter {
         timer,
       });
 
-      for (const [clientWs] of this.browserClients) {
-        this._send(clientWs, envelope);
+      const relayTarget = this._selectTargetClient();
+      if (!relayTarget) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(browserRequestId);
+        this._send(ws, { requestId: relayRequestId, error: 'No browser extension connected' });
+        return;
       }
+      this._send(relayTarget, envelope);
       return;
     }
 
@@ -189,6 +208,34 @@ export class WebSocketBridge extends EventEmitter {
 
     // Forward unhandled events
     this.emit('message', msg);
+  }
+
+  /**
+   * Choose the SINGLE browser client that should execute a command when more
+   * than one is connected. Preference: role 'keeper' over 'default'; tiebreak
+   * most-recently-connected. Only OPEN sockets are eligible. Returns the chosen
+   * ws, or null if none are usable.
+   *
+   * This replaces the former send-to-ALL broadcast fan-out, which caused every
+   * connected extension to EXECUTE mutation commands (navigate/click/switch_tab)
+   * — a real bug once a dedicated keeper Chrome runs alongside the user's
+   * personal Chrome. With a single client this always returns that client, so
+   * behavior is unchanged. Failover is automatic and per-command: a dead
+   * primary is skipped (readyState) or already evicted, and the next command
+   * re-selects the surviving client.
+   */
+  _selectTargetClient() {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const [ws, info] of this.browserClients) {
+      if (ws.readyState !== 1 /* OPEN */) continue;
+      const score = (info.role === 'keeper' ? 1e13 : 0) + (info.connectedAt || 0);
+      if (score > bestScore) {
+        bestScore = score;
+        best = ws;
+      }
+    }
+    return best;
   }
 
   /**
@@ -244,9 +291,19 @@ export class WebSocketBridge extends EventEmitter {
         timer,
       });
 
-      for (const [ws] of this.browserClients) {
-        this._send(ws, envelope);
+      // Single-target dispatch: send only to the elected client (keeper-first),
+      // never fan out to every connected extension (which double-executed
+      // mutations on multiple Chromes).
+      const target = this._selectTargetClient();
+      if (!target) {
+        clearTimeout(timer);
+        this.pendingRequests.delete(requestId);
+        const err = new Error('No browser extension connected');
+        err.code = 'NO_CLIENT';
+        reject(err);
+        return;
       }
+      this._send(target, envelope);
     });
   }
 
