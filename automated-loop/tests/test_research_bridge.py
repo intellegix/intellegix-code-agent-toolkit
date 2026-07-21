@@ -218,7 +218,16 @@ class TestResearchBridge:
     ) -> None:
         response = MagicMock()
         response.read.return_value = json.dumps({
-            "output": {"content": "Next steps: use You.com research", "content_type": "text"}
+            "output": {
+                "content": "Next steps: use You.com research [[1]]",
+                "content_type": "text",
+                "sources": [
+                    {
+                        "title": "You.com Research API docs",
+                        "url": "https://docs.you.com/",
+                    }
+                ],
+            }
         }).encode("utf-8")
         mock_urlopen.return_value.__enter__.return_value = response
 
@@ -228,6 +237,9 @@ class TestResearchBridge:
         assert result.success
         assert result.data is not None
         assert "You.com research" in result.data.response
+        assert "## Sources" in result.data.response
+        assert "You.com Research API docs" in result.data.response
+        assert "https://docs.you.com/" in result.data.response
         assert result.data.model == "youcom-research-standard"
 
 

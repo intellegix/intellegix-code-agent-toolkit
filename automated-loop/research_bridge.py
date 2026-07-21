@@ -544,9 +544,12 @@ class ResearchBridge:
             if not content:
                 return Result.fail("Empty response from You.com research", "PARSE_ERROR")
 
+            sources = output.get("sources") or data.get("sources") or []
+            response = self._format_youcom_response(content, sources)
+
             research_result = ResearchResult(
                 query=query_text[:500],
-                response=content,
+                response=response,
                 model="youcom-research-standard",
             )
             self._save_result(research_result)
@@ -567,6 +570,52 @@ class ResearchBridge:
             )
         except Exception as e:
             return Result.fail(f"You.com research query failed: {e}", "QUERY_ERROR")
+
+    def _format_youcom_response(self, content: str, sources: object) -> str:
+        """Append a readable source list to You.com research output.
+
+        You.com returns inline citation markers in the synthesized answer, plus
+        a structured `sources` array. Keeping both gives readers the answer and
+        the provenance without forcing them to infer what the markers mean.
+        """
+        normalized_sources = self._normalize_youcom_sources(sources)
+        if not normalized_sources:
+            return content
+
+        lines = [content.rstrip(), "", "## Sources"]
+        for index, source in enumerate(normalized_sources, start=1):
+            title = source.get("title") or source.get("url") or f"Source {index}"
+            url = source.get("url")
+            if url and title != url:
+                lines.append(f"{index}. {title} - {url}")
+            elif url:
+                lines.append(f"{index}. {url}")
+            else:
+                lines.append(f"{index}. {title}")
+
+        return "\n".join(lines).rstrip()
+
+    def _normalize_youcom_sources(self, sources: object) -> list[dict[str, str]]:
+        """Normalize the You.com `sources` payload into simple display rows."""
+        if not isinstance(sources, list):
+            return []
+
+        normalized: list[dict[str, str]] = []
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+
+            row: dict[str, str] = {}
+            title = item.get("title")
+            url = item.get("url")
+            if isinstance(title, str) and title.strip():
+                row["title"] = title.strip()
+            if isinstance(url, str) and url.strip():
+                row["url"] = url.strip()
+            if row:
+                normalized.append(row)
+
+        return normalized
 
     def verify_plan(
         self,
