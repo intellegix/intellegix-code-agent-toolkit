@@ -21,7 +21,9 @@ import time
 from pathlib import Path
 
 import shutil
+import subprocess
 import tempfile
+import urllib.parse
 
 from council_config import (
     BROWSER_HEADLESS,
@@ -292,6 +294,19 @@ class BrowserLock:
 # this again, edit ONLY this constant + the matching one in
 # ~/.claude/mcp-servers/browser-bridge/server.js. Don't grep-and-hunt.
 PERPLEXITY_COMMIT_KEY = "Space"
+
+# Basename of the profile dir session_keeper.py launches Chrome with (see
+# session_keeper.py: keeper_profile_dir). Used to prove a CDP endpoint really
+# belongs to the keeper and not to another app squatting the same port.
+KEEPER_PROFILE_DIRNAME = "session_keeper_profile"
+KEEPER_PROFILE_DIR = Path.home() / ".claude" / "config" / KEEPER_PROFILE_DIRNAME
+
+# Cookies that only exist in a browser profile actually logged in to Perplexity.
+# Their absence proves the attached CDP context is not a usable keeper browser.
+PERPLEXITY_AUTH_COOKIES = {
+    "__Secure-next-auth.session-token",
+    "pplx.session-id",
+}
 
 
 def _log(msg: str) -> None:
@@ -832,6 +847,165 @@ class PerplexityCouncil:
         else:
             await self._start_non_persistent()
 
+    @staticmethod
+    def _cdp_port_owner_cmdline(port: int) -> str | None:
+        """Return the command line of the process LISTENING on `port`, or None.
+
+        Windows-only (uses Get-NetTCPConnection + Win32_Process). Returns None
+        when the owner cannot be determined — callers must treat None as
+        "unknown", never as "not the keeper", so a failed probe degrades to the
+        post-attach cookie gate rather than blocking a healthy keeper.
+        """
+        if sys.platform != "win32":
+            return None
+        ps = (
+            f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+            f"-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            f"if ($c) {{ (Get-CimInstance Win32_Process -Filter "
+            f"\"ProcessId=$($c.OwningProcess)\").CommandLine }}"
+        )
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            _log(f"CDP owner probe failed ({type(e).__name__}: {e}) — owner unknown")
+            return None
+        cmdline = (out.stdout or "").strip()
+        return cmdline or None
+
+    @classmethod
+    def _cdp_endpoint_is_keeper(cls, endpoint: str, recorded_pid: int | None) -> tuple[bool, str]:
+        """Verify a live CDP endpoint actually belongs to the session keeper.
+
+        A reachable CDP port is NOT proof the keeper is alive. Port 9222 is also
+        used by `~/.claude/browser-relay/relay.mjs` (the /takeover phone relay),
+        which launches Chrome on a throwaway `C:\\Temp\\igx-cdp-profile` with no
+        Perplexity cookies. On 2026-08-07 the keeper had been disabled since
+        07-30 while a *stale* session_keeper.cdp from 08-02 still pointed at
+        9222; when the relay claimed that port at 12:57 PT, every research run
+        attached to the relay's cookie-less Chrome and died ~128s later with
+        "Target page, context or browser has been closed". Four consecutive
+        failures, machine-wide research outage.
+
+        Returns (is_keeper, reason). `is_keeper=False` means "definitely not the
+        keeper — do not attach". An indeterminate probe returns True with a
+        reason noting the uncertainty; the post-attach cookie gate is the
+        backstop for that case.
+        """
+        # Gate A — the PID recorded alongside the endpoint must still be alive.
+        # A dead PID means the .cdp file is a leftover from a previous boot and
+        # whatever answers on that port now is somebody else's Chrome.
+        if recorded_pid and recorded_pid > 0 and not cls._pid_alive(recorded_pid):
+            return False, f"recorded keeper pid {recorded_pid} is dead (stale .cdp file)"
+
+        port = 9222
+        try:
+            port = int(urllib.parse.urlparse(endpoint).port or 9222)
+        except Exception:
+            pass
+
+        # Gate B — DevToolsActivePort match. Chrome writes "<port>\n<ws-guid-path>"
+        # into its own --user-data-dir at startup. Comparing that GUID against the
+        # webSocketDebuggerUrl the endpoint reports is the canonical way to prove
+        # "this endpoint is the Chrome launched with THAT profile" — any process
+        # can serve plausible JSON on a port, so the response alone proves nothing.
+        # Portable (no process introspection) and decisive when the file exists.
+        active_port_file = KEEPER_PROFILE_DIR / "DevToolsActivePort"
+        try:
+            lines = active_port_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        if len(lines) >= 2 and lines[0].strip().isdigit():
+            keeper_port = int(lines[0].strip())
+            keeper_guid = lines[1].strip()
+            if keeper_port != port:
+                return False, (
+                    f"keeper's DevToolsActivePort says port {keeper_port}, "
+                    f"but endpoint points at {port}"
+                )
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen(f"{endpoint}/json/version", timeout=3) as _r:
+                    ws = json.loads(_r.read().decode()).get("webSocketDebuggerUrl", "")
+            except Exception as e:
+                return True, f"DevToolsActivePort read but /json/version probe failed ({type(e).__name__})"
+            if keeper_guid and keeper_guid in ws:
+                return True, f"DevToolsActivePort GUID matches endpoint on port {port}"
+            return False, (
+                f"endpoint on port {port} reports a different DevTools GUID than the "
+                f"keeper's profile — a foreign Chrome is serving this port"
+            )
+
+        # Gate C — no DevToolsActivePort (keeper not running, or its profile was
+        # cleaned). Fall back to checking that the process listening on the port
+        # is running the keeper's profile dir.
+        cmdline = cls._cdp_port_owner_cmdline(port)
+        if cmdline is None:
+            return True, "port owner unknown (probe unavailable) — deferring to cookie gate"
+        if KEEPER_PROFILE_DIRNAME in cmdline:
+            return True, f"port {port} owned by keeper profile ({KEEPER_PROFILE_DIRNAME})"
+        foreign = (
+            "browser-relay /takeover"
+            if "igx-cdp-profile" in cmdline
+            else "unidentified app"
+        )
+        return False, (
+            f"port {port} is owned by a FOREIGN Chrome ({foreign}) — "
+            f"no '{KEEPER_PROFILE_DIRNAME}' in its command line"
+        )
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """True if `pid` names a live process. Windows-safe (see _is_session_keeper_running)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True  # exists but inaccessible
+        except (ProcessLookupError, OSError, SystemError):
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    h = ctypes.windll.kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+                    )
+                    if h:
+                        ctypes.windll.kernel32.CloseHandle(h)
+                        return True
+                except Exception:
+                    pass
+            return False
+
+    async def _cdp_context_has_perplexity_session(self) -> bool:
+        """True if the attached CDP context carries a Perplexity login cookie.
+
+        Backstop for `_cdp_endpoint_is_keeper` when the port-owner probe is
+        unavailable: a foreign/throwaway Chrome profile has zero perplexity.ai
+        cookies, so this separates "the keeper" from "somebody else's browser"
+        without depending on Windows process introspection. It also catches a
+        live keeper whose login has actually expired.
+        """
+        try:
+            cookies = await self.context.cookies()
+        except Exception as e:
+            _log(f"CDP cookie gate: could not read cookies ({type(e).__name__}) — allowing attach")
+            return True  # don't block on an unexpected Playwright error
+        names = {
+            c.get("name")
+            for c in cookies
+            if "perplexity.ai" in (c.get("domain") or "")
+        }
+        if names & PERPLEXITY_AUTH_COOKIES:
+            return True
+        _log(
+            f"CDP cookie gate: attached context has {len(names)} perplexity.ai cookie(s), "
+            f"none of {sorted(PERPLEXITY_AUTH_COOKIES)} — not a logged-in keeper browser"
+        )
+        return False
+
     async def _start_via_cdp(self) -> bool:
         """Attach to a running session_keeper.py via Chrome DevTools Protocol.
 
@@ -858,11 +1032,24 @@ class PerplexityCouncil:
         # removed (observed 2026-05-25 — user closed Chrome window, the file
         # got cleaned up by some path, but Chrome's child processes kept
         # serving the port).
+        # NOTE: "port 9222 answers" is NOT the same as "the keeper is up" — the
+        # /takeover browser-relay serves CDP on the same port. Only synthesize
+        # the endpoint file once the listening process is confirmed to be running
+        # the keeper's own profile, otherwise we manufacture a valid-looking
+        # endpoint pointing at somebody else's Chrome (the 2026-08-07 outage).
         if not cdp_file.exists():
             try:
                 import urllib.request as _ur
                 with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
                     _ = _r.read()
+                owner = self._cdp_port_owner_cmdline(9222)
+                if owner is not None and KEEPER_PROFILE_DIRNAME not in owner:
+                    _log(
+                        "CDP-attach: port 9222 is serving CDP but is NOT the keeper "
+                        f"(no '{KEEPER_PROFILE_DIRNAME}' in owner cmdline) — refusing to "
+                        "synthesize an endpoint file for a foreign browser"
+                    )
+                    raise RuntimeError("foreign CDP owner")
                 # Port is up — write a fresh CDP file so the rest of the path
                 # can use it. The keeper would have written this normally.
                 cdp_file.parent.mkdir(parents=True, exist_ok=True)
@@ -872,7 +1059,7 @@ class PerplexityCouncil:
                 )
                 _log("CDP-attach: Chrome alive on 9222 but .cdp file missing — synthesized it")
             except Exception:
-                pass  # port not reachable; fall through to keeper auto-start
+                pass  # port not reachable / not the keeper; fall through
 
         # Auto-start the keeper task if CDP still isn't reachable. Avoids the
         # headful local-launch fallback that creates focus-stealing popups.
@@ -915,6 +1102,23 @@ class PerplexityCouncil:
                 except Exception as e:
                     _log(f"CDP-attach skipped: endpoint {endpoint_probe} unreachable ({type(e).__name__}); falling back to launch")
                     return False
+                # Reachable is not enough — prove it is the keeper's Chrome.
+                # A stale .cdp file plus a foreign app on the same port is the
+                # exact combination that produced the 2026-08-07 outage.
+                recorded_pid = data.get("pid")
+                ok, why = self._cdp_endpoint_is_keeper(
+                    endpoint_probe,
+                    recorded_pid if isinstance(recorded_pid, int) else None,
+                )
+                if not ok:
+                    _log(f"CDP-attach REFUSED: {why} — falling back to local launch")
+                    try:
+                        cdp_file.unlink()
+                        _log("Removed stale session_keeper.cdp so later runs re-probe cleanly")
+                    except Exception:
+                        pass
+                    return False
+                _log(f"CDP identity OK: {why}")
         except Exception:
             pass  # let the connect_over_cdp below try and produce its own error
         try:
@@ -939,6 +1143,19 @@ class PerplexityCouncil:
                 self._browser = None
                 return False
             self.context = contexts[0]
+
+            # Backstop identity gate: a browser that is not logged in to
+            # Perplexity is useless to us, and a foreign/throwaway profile has
+            # no perplexity.ai cookies at all. Catches the wrong-browser case
+            # even when the Windows port-owner probe was unavailable, and also
+            # catches a genuinely expired keeper login — both of which used to
+            # present as a ~128s hang ending in "browser has been closed".
+            if not await self._cdp_context_has_perplexity_session():
+                _log("CDP attach REFUSED by cookie gate — falling back to local launch")
+                self.context = None
+                self._browser = None  # never .close() a CDP browser: kills remote Chrome
+                return False
+
             self._cdp_attached = True
             existing_count = len(self.context.pages)
             _log(f"CDP attach OK: {len(contexts)} context(s); using contexts[0] with {existing_count} existing page(s)")
