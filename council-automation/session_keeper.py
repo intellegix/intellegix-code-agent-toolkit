@@ -540,9 +540,28 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         # launch, and ran the local-launch freshness guard -- the code path that
         # produced the 2026-08-08 outage.
         #
-        # Some jobs set JOB_OBJECT_LIMIT_BREAKAWAY_OK off, in which case
-        # CreateProcess fails outright; retry without the flag so a
-        # short-lived Chrome still beats no Chrome at all.
+        # MEASURED CAVEAT — the flag helps, but NOT under Task Scheduler.
+        # Breakaway only succeeds if the CONTAINING job grants
+        # JOB_OBJECT_LIMIT_BREAKAWAY_OK, and Task Scheduler's job does not:
+        # launched from the task, this raises [WinError 5] Access is denied and
+        # falls back below (observed 2026-08-08 07:27). Launched from an
+        # interactive shell it works and Chrome persists. This is the same
+        # constraint that killed the Santee demo app — already proved with
+        # IsProcessInJob, see memory port-registry, do not re-litigate it.
+        #
+        # The proper fix there was to make the long-lived process the task's OWN
+        # process rather than a child of it. That is NOT applied here: it would
+        # need either a new scheduled task (schtasks /Create is denied without
+        # elevation on this box) or reverting the keeper to a long-lived loop,
+        # which was abandoned in May because pythonw under Task Scheduler died
+        # silently inside asyncio.sleep (see memory session-keeper-history).
+        #
+        # Consequence, stated plainly: under Task Scheduler the keeper's Chrome
+        # lives on the order of minutes and is re-established by the task's own
+        # repetition. Nothing DEPENDS on it — the local-launch path has a
+        # correct freshness guard and a working refresher — so this is a
+        # latency optimization, not a availability requirement. Left as a known
+        # open item rather than papered over.
         import subprocess
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000 if sys.platform == "win32" else 0
         base_flags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
