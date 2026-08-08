@@ -1734,6 +1734,24 @@ class PerplexityCouncil:
         Tier 2: text-scan for 'Model council' (tolerates DOM drift).
         Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        # button (same Perplexity redesign that broke the research verifier).
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'model council' || label === 'council')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=council indicator=tier0_aria_pressed")
+                return True
+        except Exception as _e0:
+            _log(f"activate_mode verify=tier0_ERROR mode=council exception={_e0!r}")
+
         # Tier 1: stable aria-label selector
         try:
             three_models = self.selectors.get("threeModelsDropdown", "button[aria-label='3 models']")
@@ -1762,12 +1780,35 @@ class PerplexityCouncil:
     async def _verify_research_activation(self, page) -> bool:
         """Verify Research mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the toolbar mode
+        button. Perplexity moved the indicator from a TEXT pill to an
+        ICON-ONLY button (aria-label="Deep research", aria-pressed="true")
+        with EMPTY textContent, so the tier1/tier2 text scans below can no
+        longer see it and falsely report SELECTOR_DRIFT. Verified via live DOM
+        probe. aria-pressed is the reliable active-state discriminator.
         Tier 1: exact-text match for the activated mode pill ("Deep research"
         or "Research" exactly). Catches the canonical activated state.
         Tier 2: case-insensitive contains scan for 'deep research' or
         exact 'research'. Tolerates minor Perplexity UI tweaks.
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'deep research' || label === 'research')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=research indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=research exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {
@@ -1808,10 +1849,28 @@ class PerplexityCouncil:
     async def _verify_labs_activation(self, page) -> bool:
         """Verify Labs mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        button (same Perplexity redesign that broke the research verifier).
         Tier 1: exact-text 'Labs' on a toolbar pill.
         Tier 2: case-insensitive contains 'labs' (looser fallback).
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (label === 'labs' && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=labs indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=labs exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {

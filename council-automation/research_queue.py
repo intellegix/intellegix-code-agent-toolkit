@@ -63,6 +63,15 @@ POLL_S = 1.5
 MAX_WAIT_S = int(os.environ.get("RESEARCH_QUEUE_MAX_WAIT", "1200"))
 ACTIVITY_LOG_LOCK_TIMEOUT_S = 10  # exposed for tests (monkeypatchable)
 SNAPSHOT_LOCK_TIMEOUT_S = 5  # exposed for tests (monkeypatchable)
+# os.replace() onto a destination with a concurrent open handle raises
+# PermissionError (WinError 5 / ERROR_ACCESS_DENIED) on Windows. The snapshot
+# FileLock serializes writers but cannot exclude readers (monitor, queue
+# daemon, MCP status tool, other runners checking their position), so the
+# swap is retried a few times with a short backoff to ride out that transient
+# sharing violation. 12 * 25ms = 300ms worst case; readers hold the file for
+# microseconds so the swap almost always succeeds on the first or second try.
+_ATOMIC_REPLACE_RETRIES = 12  # exposed for tests (monkeypatchable)
+_ATOMIC_REPLACE_BACKOFF_S = 0.025  # exposed for tests (monkeypatchable)
 STATS_LOOKBACK_LINES = 5000  # tail bound for today's-stats scan (see _compute_today_stats)
 
 # Windows OpenProcess() access right sufficient only to query existence --
@@ -130,7 +139,24 @@ def _atomic_write(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.replace(tmp_name, path)
+        # os.replace is atomic, but on Windows it raises PermissionError
+        # (WinError 5) when the destination has a concurrent open handle -- a
+        # reader (monitor / queue daemon / MCP status tool / another runner
+        # checking its position) holding the file open at the instant of the
+        # swap. That sharing violation is transient (readers hold it for
+        # microseconds), so retry the swap a few times with a short backoff
+        # before surfacing the error. Without this, a lost race silently drops
+        # a run's completion/instrumentation write, or aborts the caller's run
+        # outright (see publish_snapshot: WinError 5 is not the Timeout it
+        # catches, so it would otherwise propagate).
+        for _attempt in range(_ATOMIC_REPLACE_RETRIES):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError:
+                if _attempt == _ATOMIC_REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(_ATOMIC_REPLACE_BACKOFF_S)
     except Exception:
         try:
             os.unlink(tmp_name)
