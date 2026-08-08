@@ -918,12 +918,22 @@ class PerplexityCouncil:
         reason noting the uncertainty; the post-attach cookie gate is the
         backstop for that case.
         """
-        # Gate A — the PID recorded alongside the endpoint must still be alive.
-        # A dead PID means the .cdp file is a leftover from a previous boot and
-        # whatever answers on that port now is somebody else's Chrome.
-        if recorded_pid and recorded_pid > 0 and not cls._pid_alive(recorded_pid):
-            return False, f"recorded keeper pid {recorded_pid} is dead (stale .cdp file)"
-
+        # Gate ordering matters, and getting it wrong is not a safe failure.
+        #
+        # The recorded-PID check used to run FIRST and veto everything else. But
+        # the keeper is one-shot per invocation: it launches Chrome DETACHED and
+        # exits within seconds, so the pid it published was ALWAYS dead by the
+        # time a reader looked (it published its own pid, not Chrome's — fixed
+        # in session_keeper.py). Every healthy keeper was therefore judged a
+        # stale .cdp file, the file was deleted, and every run fell back to a
+        # local launch. That is how the 08-08 outage reached the local-launch
+        # freshness guard at all: an over-strict identity gate silently disabled
+        # the CDP path it was written to protect.
+        #
+        # So: run the DECISIVE gates first (DevToolsActivePort GUID, then port
+        # ownership). The recorded pid is the weakest signal — it describes the
+        # launcher, not the server — and now only breaks ties when neither
+        # decisive gate can reach a verdict.
         port = KEEPER_CDP_PORT
         try:
             port = int(urllib.parse.urlparse(endpoint).port or KEEPER_CDP_PORT)
@@ -966,19 +976,30 @@ class PerplexityCouncil:
         # cleaned). Fall back to checking that the process listening on the port
         # is running the keeper's profile dir.
         cmdline = cls._cdp_port_owner_cmdline(port)
-        if cmdline is None:
-            return True, "port owner unknown (probe unavailable) — deferring to cookie gate"
-        if KEEPER_PROFILE_DIRNAME in cmdline:
-            return True, f"port {port} owned by keeper profile ({KEEPER_PROFILE_DIRNAME})"
-        foreign = (
-            "browser-relay /takeover"
-            if "igx-cdp-profile" in cmdline
-            else "unidentified app"
-        )
-        return False, (
-            f"port {port} is owned by a FOREIGN Chrome ({foreign}) — "
-            f"no '{KEEPER_PROFILE_DIRNAME}' in its command line"
-        )
+        if cmdline is not None:
+            if KEEPER_PROFILE_DIRNAME in cmdline:
+                return True, f"port {port} owned by keeper profile ({KEEPER_PROFILE_DIRNAME})"
+            foreign = (
+                "browser-relay /takeover"
+                if "igx-cdp-profile" in cmdline
+                else "unidentified app"
+            )
+            return False, (
+                f"port {port} is owned by a FOREIGN Chrome ({foreign}) — "
+                f"no '{KEEPER_PROFILE_DIRNAME}' in its command line"
+            )
+
+        # Gate D — last resort, and the ONLY place the recorded pid is consulted.
+        # Both decisive gates were indeterminate (no DevToolsActivePort file and
+        # the owner probe is unavailable, e.g. non-Windows), so fall back to
+        # "was the process that wrote this file still around". A dead pid here
+        # is genuine evidence of a leftover .cdp file from a previous boot.
+        if recorded_pid and recorded_pid > 0 and not cls._pid_alive(recorded_pid):
+            return False, (
+                f"no identity proof available and recorded pid {recorded_pid} is "
+                f"dead — treating .cdp file as stale"
+            )
+        return True, "port owner unknown (probe unavailable) — deferring to cookie gate"
 
     @classmethod
     def _keeper_cdp_alive(cls) -> tuple[bool, str]:

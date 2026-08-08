@@ -280,3 +280,54 @@ def test_disabled_keeper_task_skips_the_120s_wait(monkeypatch: pytest.MonkeyPatc
     assert fired["keeper"] is False
     assert fired["direct"] is True, "should route straight to the direct refresher"
     assert time.time() - t0 < cb.SESSION_KEEPER_WAIT_S / 2, "must not wait on a no-op task"
+
+
+# --------------------------------------------------------------------------
+# Defect 3 -- an over-strict identity gate that disabled the path it guarded
+# --------------------------------------------------------------------------
+def test_live_keeper_not_rejected_for_dead_launcher_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The keeper is one-shot: it launches Chrome DETACHED and exits seconds
+    later. When the recorded-pid check ran first and vetoed, EVERY healthy
+    keeper was judged a stale .cdp file and every run fell back to a local
+    launch -- which is how the outage reached the local-launch guard at all.
+    Positive proof of ownership must win over a dead launcher pid.
+    """
+    monkeypatch.setattr(cb, "KEEPER_PROFILE_DIR", Path("no-such-profile-dir"))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_cdp_port_owner_cmdline",
+                        staticmethod(lambda port: r"chrome.exe --user-data-dir=C:\x\session_keeper_profile"))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_pid_alive", staticmethod(lambda pid: False))
+
+    ok, why = cb.PerplexityCouncil._cdp_endpoint_is_keeper(
+        f"http://127.0.0.1:{cb.KEEPER_CDP_PORT}", recorded_pid=9684)
+
+    assert ok is True, f"live keeper wrongly rejected: {why}"
+    assert "keeper profile" in why
+
+
+def test_foreign_owner_still_rejected_even_with_live_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loosening gate A must not loosen the actual protection."""
+    monkeypatch.setattr(cb, "KEEPER_PROFILE_DIR", Path("no-such-profile-dir"))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_cdp_port_owner_cmdline",
+                        staticmethod(lambda port: r"chrome.exe --user-data-dir=C:\Temp\igx-cdp-profile"))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_pid_alive", staticmethod(lambda pid: True))
+
+    ok, why = cb.PerplexityCouncil._cdp_endpoint_is_keeper(
+        f"http://127.0.0.1:{cb.KEEPER_CDP_PORT}", recorded_pid=1234)
+
+    assert ok is False
+    assert "browser-relay /takeover" in why
+
+
+def test_dead_pid_still_rejected_when_no_proof_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With both decisive gates indeterminate, the recorded pid is all there
+    is, and a dead one is genuine evidence of a leftover file.
+    """
+    monkeypatch.setattr(cb, "KEEPER_PROFILE_DIR", Path("no-such-profile-dir"))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_cdp_port_owner_cmdline", staticmethod(lambda port: None))
+    monkeypatch.setattr(cb.PerplexityCouncil, "_pid_alive", staticmethod(lambda pid: False))
+
+    ok, why = cb.PerplexityCouncil._cdp_endpoint_is_keeper(
+        f"http://127.0.0.1:{cb.KEEPER_CDP_PORT}", recorded_pid=9684)
+
+    assert ok is False
+    assert "stale" in why

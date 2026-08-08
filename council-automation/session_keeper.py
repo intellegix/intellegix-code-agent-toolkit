@@ -346,6 +346,28 @@ async def _navigate_and_warm(page) -> bool:
     return False
 
 
+def _cdp_serving_pid(port: int) -> int | None:
+    """PID of the process LISTENING on `port`, or None if it cannot be read.
+
+    This is the pid published in session_keeper.cdp -- readers need the process
+    that actually answers CDP, which outlives this one-shot keeper invocation.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+             f"-ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return int((out.stdout or "").strip())
+    except Exception as exc:
+        _log(f"CDP serving-pid probe failed ({type(exc).__name__}: {exc})")
+        return None
+
+
 def _cdp_port_owner_cmdline(port: int) -> str | None:
     """Command line of the process LISTENING on `port`, or None if unknown.
 
@@ -505,16 +527,44 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
     if not chrome_already_up:
         DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
         CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
-        creationflags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        # CREATE_BREAKAWAY_FROM_JOB is what actually makes the one-shot design
+        # work, and its absence is why the keeper has effectively never stayed
+        # up. DETACHED_PROCESS only detaches the console; it does NOT escape a
+        # Windows job object, and every realistic launcher puts us in one --
+        # Task Scheduler assigns each task instance a job, and so does the
+        # agent harness that runs ad-hoc commands. When the launching task
+        # instance ended, the job was torn down and took Chrome with it within
+        # a minute or two, cleanly (Chrome even removed its DevToolsActivePort
+        # file, which is what made this look like a normal shutdown rather than
+        # a kill). Every subsequent run then found no CDP, fell back to a local
+        # launch, and ran the local-launch freshness guard -- the code path that
+        # produced the 2026-08-08 outage.
+        #
+        # Some jobs set JOB_OBJECT_LIMIT_BREAKAWAY_OK off, in which case
+        # CreateProcess fails outright; retry without the flag so a
+        # short-lived Chrome still beats no Chrome at all.
         import subprocess
-        chrome_proc = subprocess.Popen(
-            chrome_args,
-            creationflags=creationflags,
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000 if sys.platform == "win32" else 0
+        base_flags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        popen_kwargs = dict(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        try:
+            chrome_proc = subprocess.Popen(
+                chrome_args,
+                creationflags=base_flags | CREATE_BREAKAWAY_FROM_JOB,
+                **popen_kwargs,
+            )
+            _log("Chrome launched with CREATE_BREAKAWAY_FROM_JOB (survives launcher teardown)")
+        except OSError as exc:
+            _log(f"Job breakaway not permitted ({exc}); launching without it — "
+                 f"Chrome may not outlive this launcher")
+            chrome_proc = subprocess.Popen(
+                chrome_args, creationflags=base_flags, **popen_kwargs,
+            )
         _log(f"Chrome subprocess pid={chrome_proc.pid}; waiting for CDP port {cdp_port}...")
     # Wait for CDP to be responsive — whether from a fresh launch or a
     # pre-existing Chrome.
@@ -566,8 +616,23 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         # Windows, but Chrome's --remote-debugging-port listens on IPv4 only,
         # causing Playwright's connect_over_cdp to ECONNREFUSED on IPv6.
         cdp_endpoint = f"http://127.0.0.1:{cdp_port}"
+        # `pid` MUST be the pid of the process actually SERVING CDP, i.e. Chrome
+        # -- not this keeper python. The keeper is one-shot per invocation and
+        # exits seconds from now while its DETACHED_PROCESS Chrome lives on, so
+        # recording os.getpid() here published a pid that was always dead by the
+        # time any reader looked. council_browser's liveness gate then read the
+        # healthy keeper as a stale .cdp file, deleted it, and fell back to a
+        # local launch on EVERY run -- which is how the 08-08 outage reached the
+        # local-launch freshness guard at all. Keep the launcher pid separately
+        # for diagnostics; it is not an identity signal.
+        chrome_pid = _cdp_serving_pid(cdp_port)
         KEEPER_CDP_FILE.write_text(
-            json.dumps({"port": cdp_port, "endpoint": cdp_endpoint, "pid": os.getpid()}),
+            json.dumps({
+                "port": cdp_port,
+                "endpoint": cdp_endpoint,
+                "pid": chrome_pid,
+                "keeper_python_pid": os.getpid(),
+            }),
             encoding="utf-8",
         )
         _log(f"Refresh complete: {n} cookies written. CDP endpoint: {cdp_endpoint}")
