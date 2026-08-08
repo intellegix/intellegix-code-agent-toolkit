@@ -315,7 +315,12 @@ def test_foreign_owner_still_rejected_even_with_live_pid(monkeypatch: pytest.Mon
         f"http://127.0.0.1:{cb.KEEPER_CDP_PORT}", recorded_pid=1234)
 
     assert ok is False
-    assert "browser-relay /takeover" in why
+    # The label must name the ACTUAL squatter and warn it is load-bearing --
+    # a human reads this string to decide what to go kill. The igx-cdp-profile
+    # Chrome is launched by the Dogfood Supervisor (verified via the parent
+    # chain 2026-08-08), not by relay.mjs as long assumed.
+    assert "Dogfood Supervisor" in why
+    assert "do NOT kill" in why
 
 
 def test_dead_pid_still_rejected_when_no_proof_available(monkeypatch: pytest.MonkeyPatch) -> None:

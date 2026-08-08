@@ -315,9 +315,11 @@ PERPLEXITY_COMMIT_KEY = "Space"
 KEEPER_PROFILE_DIRNAME = "session_keeper_profile"
 KEEPER_PROFILE_DIR = Path.home() / ".claude" / "config" / KEEPER_PROFILE_DIRNAME
 
-# CDP port the keeper owns. Historically 9222 -- which is ALSO the port
-# ~/.claude/browser-relay/relay.mjs (the /takeover phone relay) binds, and
-# whichever process boots first wins. That collision produced the 2026-08-07
+# CDP port the keeper owns. Historically 9222 -- which is ALSO the port used by
+# the Chrome on the C:\Temp\igx-cdp-profile profile (launched by the Dogfood
+# Supervisor, start-dogfood.cmd, at logon; the profile name is browser-relay's,
+# which is why it was long misattributed to relay.mjs / /takeover). It auto-
+# starts and holds the port, so the keeper simply lost. That produced the 08-07
 # outage (runner attached to the relay's cookie-less Chrome) and again the
 # 2026-08-08 outage (relay held 9222, so the freshness guard below believed
 # "the keeper is alive" and fired a refresh that could never land). The keeper
@@ -979,8 +981,18 @@ class PerplexityCouncil:
         if cmdline is not None:
             if KEEPER_PROFILE_DIRNAME in cmdline:
                 return True, f"port {port} owned by keeper profile ({KEEPER_PROFILE_DIRNAME})"
+            # Label the squatter accurately -- this string is what a human
+            # reads when deciding what to go kill, and getting it wrong sends
+            # them after the wrong process. The C:\Temp\igx-cdp-profile Chrome
+            # is LAUNCHED BY the Dogfood Supervisor (start-dogfood.cmd, auto-
+            # starts at logon), verified 2026-08-08 by walking the parent chain:
+            # chrome pid -> cmd.exe -> start-dogfood.cmd. The profile name comes
+            # from browser-relay, which is why it was long misattributed to
+            # relay.mjs / /takeover. Either way it is LOAD-BEARING and must not
+            # be killed: the supervisor relaunches a byte-identical Chrome
+            # within ~3s, and the phone-takeover bridge on :7070 depends on it.
             foreign = (
-                "browser-relay /takeover"
+                "Dogfood Supervisor (start-dogfood.cmd) -- load-bearing, do NOT kill"
                 if "igx-cdp-profile" in cmdline
                 else "unidentified app"
             )
