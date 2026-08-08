@@ -129,7 +129,16 @@ KEEPER_PID_FILE = Path.home() / ".claude" / "config" / "session_keeper.pid"
 KEEPER_HEARTBEAT_FILE = Path.home() / ".claude" / "config" / "session_keeper.heartbeat"
 KEEPER_CDP_FILE = Path.home() / ".claude" / "config" / "session_keeper.cdp"
 DEFAULT_INTERVAL_S = 1200  # 20 min (CF __cf_bm has ~30min TTL; refresh well before expiry)
-DEFAULT_CDP_PORT = 9222  # Chrome DevTools Protocol port for council_browser CDP attach
+# Chrome DevTools Protocol port the keeper owns, for council_browser's CDP
+# attach. Moved off 9222 on 2026-08-08: ~/.claude/browser-relay/relay.mjs (the
+# /takeover phone relay) binds 9222 too, whichever process boots first wins,
+# and that collision caused BOTH the 08-07 and 08-08 machine-wide research
+# outages. The keeper and the relay now have disjoint ports and can coexist,
+# which is also what unblocks re-enabling the PerplexitySessionKeeper task
+# (Disabled since 2026-07-30 because re-enabling it would have fought the relay
+# for 9222). Must match council_browser.KEEPER_CDP_PORT -- both read
+# COUNCIL_KEEPER_CDP_PORT so a single env var moves them together.
+DEFAULT_CDP_PORT = int(os.environ.get("COUNCIL_KEEPER_CDP_PORT", "9223"))
 
 
 def _log(msg: str) -> None:
@@ -337,6 +346,33 @@ async def _navigate_and_warm(page) -> bool:
     return False
 
 
+def _cdp_port_owner_cmdline(port: int) -> str | None:
+    """Command line of the process LISTENING on `port`, or None if unknown.
+
+    Windows-only. None means "could not determine" and must be treated as
+    unknown, never as "foreign" -- a failed probe should not stop the keeper.
+    Mirrors council_browser.PerplexityCouncil._cdp_port_owner_cmdline.
+    """
+    if sys.platform != "win32":
+        return None
+    ps = (
+        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+        f"-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        f"if ($c) {{ (Get-CimInstance Win32_Process -Filter "
+        f"\"ProcessId=$($c.OwningProcess)\").CommandLine }}"
+    )
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception as exc:
+        _log(f"CDP owner probe failed ({type(exc).__name__}: {exc}) - owner unknown")
+        return None
+    return (out.stdout or "").strip() or None
+
+
 async def _wait_for_cdp(port: int, timeout: float = 30.0) -> dict | None:
     """Poll Chrome's CDP /json/version endpoint until it responds, or timeout."""
     import urllib.request as _ur
@@ -438,9 +474,22 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         with _ur.urlopen(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2) as _r:
             _ = _r.read()
         chrome_already_up = True
-        _log(f"Chrome already serving CDP on port {cdp_port}; reusing it (no relaunch)")
     except Exception:
         chrome_already_up = False
+    if chrome_already_up:
+        # "Something answers CDP here" is NOT "our Chrome is here". Reusing a
+        # foreign browser hands the keeper a cookie-less profile it then
+        # publishes as the live Perplexity session -- the 2026-08-07 failure,
+        # from the other side. Prove the listener is running OUR profile dir
+        # before adopting it; otherwise refuse the port loudly rather than
+        # silently keeping a session nobody is logged in to.
+        owner = _cdp_port_owner_cmdline(cdp_port)
+        if owner is not None and keeper_profile_dir.name not in owner:
+            _log(f"REFUSING port {cdp_port}: it is served by a FOREIGN process "
+                 f"(no '{keeper_profile_dir.name}' in its command line). Set "
+                 f"COUNCIL_KEEPER_CDP_PORT to a free port. Owner: {owner[:160]}")
+            return
+        _log(f"Chrome already serving CDP on port {cdp_port}; reusing it (no relaunch)")
     if not chrome_already_up:
         # Only sweep orphans if NOTHING is serving CDP — that means whatever
         # Chrome was tied to our profile dir is in a half-dead state and

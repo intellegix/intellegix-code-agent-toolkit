@@ -1071,6 +1071,10 @@ def format_synthesis_output(results: dict) -> str:
             f"**Code:** {code}\n"
             f"**Step:** {step}\n\n"
             f"If BROWSER_BUSY: another session is using Playwright. Wait ~2 min.\n"
+            f"If SESSION_STALE: Perplexity cookies are expired and auto-refresh "
+            f"could not renew them. Run `/cache-perplexity-session`, then retry. "
+            f"This aborts BEFORE submitting, so no queue slot was wasted — do not "
+            f"treat it as a transient failure to retry blindly.\n"
             f"If session expired: run `python council_browser.py --save-session`\n"
         )
 

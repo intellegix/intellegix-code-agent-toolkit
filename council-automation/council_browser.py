@@ -93,6 +93,20 @@ class BrowserBusyError(Exception):
     pass
 
 
+class SessionStaleError(Exception):
+    """Raised when critical Perplexity cookies are EXPIRED and no refresh path
+    could renew them, so submitting the query would be knowingly doomed.
+
+    Replaces the old `keeper-timeout-stale-proceed` behaviour. Proceeding on
+    expired cookies converted a clean, diagnosable "the session is dead" into a
+    5-8 minute mid-run death that also consumed a slot on a serialized queue
+    (2026-08-08 outage: two consecutive runs burned ~9 minutes each this way).
+    Failing here costs seconds and names the fix. Set COUNCIL_ALLOW_STALE=1 to
+    restore the old proceed-anyway behaviour.
+    """
+    pass
+
+
 class SessionSemaphore:
     """File-based named-slot semaphore for concurrent browser sessions.
 
@@ -300,6 +314,16 @@ PERPLEXITY_COMMIT_KEY = "Space"
 # belongs to the keeper and not to another app squatting the same port.
 KEEPER_PROFILE_DIRNAME = "session_keeper_profile"
 KEEPER_PROFILE_DIR = Path.home() / ".claude" / "config" / KEEPER_PROFILE_DIRNAME
+
+# CDP port the keeper owns. Historically 9222 -- which is ALSO the port
+# ~/.claude/browser-relay/relay.mjs (the /takeover phone relay) binds, and
+# whichever process boots first wins. That collision produced the 2026-08-07
+# outage (runner attached to the relay's cookie-less Chrome) and again the
+# 2026-08-08 outage (relay held 9222, so the freshness guard below believed
+# "the keeper is alive" and fired a refresh that could never land). The keeper
+# now gets a DEDICATED port so the two can never contend. Override with
+# COUNCIL_KEEPER_CDP_PORT if 9223 ever conflicts. See memory port-registry.
+KEEPER_CDP_PORT = int(os.environ.get("COUNCIL_KEEPER_CDP_PORT", "9223"))
 
 # Cookies that only exist in a browser profile actually logged in to Perplexity.
 # Their absence proves the attached CDP context is not a usable keeper browser.
@@ -900,9 +924,9 @@ class PerplexityCouncil:
         if recorded_pid and recorded_pid > 0 and not cls._pid_alive(recorded_pid):
             return False, f"recorded keeper pid {recorded_pid} is dead (stale .cdp file)"
 
-        port = 9222
+        port = KEEPER_CDP_PORT
         try:
-            port = int(urllib.parse.urlparse(endpoint).port or 9222)
+            port = int(urllib.parse.urlparse(endpoint).port or KEEPER_CDP_PORT)
         except Exception:
             pass
 
@@ -955,6 +979,56 @@ class PerplexityCouncil:
             f"port {port} is owned by a FOREIGN Chrome ({foreign}) — "
             f"no '{KEEPER_PROFILE_DIRNAME}' in its command line"
         )
+
+    @classmethod
+    def _keeper_cdp_alive(cls) -> tuple[bool, str]:
+        """True only if the keeper's OWN Chrome is serving CDP on KEEPER_CDP_PORT.
+
+        This is the identity-gated twin of the check `_start_via_cdp` performs.
+        It exists because the 2026-08-08 outage came from the *unguarded* copy of
+        this probe in `_ensure_fresh_session`: that one asked only "does the port
+        answer /json/version?", concluded the keeper was alive when the /takeover
+        relay held 9222, and so routed every refresh down the keeper branch --
+        which then could not possibly land. Reachability is not identity; prove
+        ownership before believing a port belongs to us.
+        """
+        endpoint = f"http://127.0.0.1:{KEEPER_CDP_PORT}"
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(f"{endpoint}/json/version", timeout=2) as _r:
+                _ = _r.read()
+        except Exception as e:
+            return False, f"no CDP on port {KEEPER_CDP_PORT} ({type(e).__name__})"
+        return cls._cdp_endpoint_is_keeper(endpoint, None)
+
+    @staticmethod
+    def _keeper_task_state() -> str:
+        """State of the PerplexitySessionKeeper scheduled task.
+
+        Returns one of "Ready" | "Running" | "Disabled" | "Missing" | "Unknown".
+
+        Firing `Start-ScheduledTask` at a **Disabled** task is a silent no-op:
+        it neither errors usefully nor runs anything. The task had been Disabled
+        since 2026-07-30, so every `_ensure_fresh_session` keeper refresh since
+        then burned the full SESSION_KEEPER_WAIT_S and then proceeded stale --
+        the 120s of dead wall-clock at the head of every doomed run on 08-08.
+        Check the state first and skip the branch when it cannot possibly work.
+        """
+        if sys.platform != "win32":
+            return "Unknown"
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "$t = Get-ScheduledTask -TaskName 'PerplexitySessionKeeper' "
+                 "-ErrorAction SilentlyContinue; "
+                 "if ($t) { $t.State } else { 'Missing' }"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            _log(f"Keeper task-state probe failed ({type(e).__name__}: {e})")
+            return "Unknown"
+        state = (out.stdout or "").strip()
+        return state or "Unknown"
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -1040,12 +1114,12 @@ class PerplexityCouncil:
         if not cdp_file.exists():
             try:
                 import urllib.request as _ur
-                with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
+                with _ur.urlopen(f"http://127.0.0.1:{KEEPER_CDP_PORT}/json/version", timeout=2) as _r:
                     _ = _r.read()
-                owner = self._cdp_port_owner_cmdline(9222)
+                owner = self._cdp_port_owner_cmdline(KEEPER_CDP_PORT)
                 if owner is not None and KEEPER_PROFILE_DIRNAME not in owner:
                     _log(
-                        "CDP-attach: port 9222 is serving CDP but is NOT the keeper "
+                        f"CDP-attach: port {KEEPER_CDP_PORT} is serving CDP but is NOT the keeper "
                         f"(no '{KEEPER_PROFILE_DIRNAME}' in owner cmdline) — refusing to "
                         "synthesize an endpoint file for a foreign browser"
                     )
@@ -1054,10 +1128,12 @@ class PerplexityCouncil:
                 # can use it. The keeper would have written this normally.
                 cdp_file.parent.mkdir(parents=True, exist_ok=True)
                 cdp_file.write_text(
-                    json.dumps({"port": 9222, "endpoint": "http://127.0.0.1:9222"}),
+                    json.dumps({"port": KEEPER_CDP_PORT,
+                                "endpoint": f"http://127.0.0.1:{KEEPER_CDP_PORT}"}),
                     encoding="utf-8",
                 )
-                _log("CDP-attach: Chrome alive on 9222 but .cdp file missing — synthesized it")
+                _log(f"CDP-attach: Chrome alive on {KEEPER_CDP_PORT} but .cdp file "
+                     f"missing — synthesized it")
             except Exception:
                 pass  # port not reachable / not the keeper; fall through
 
@@ -1292,11 +1368,17 @@ class PerplexityCouncil:
 
         Fires the keeper task (idempotent — Task Scheduler refuses a 2nd instance
         of the one-shot, so no lock is needed) and waits up to SESSION_KEEPER_WAIT_S
-        for the cookies-file mtime to bump. On timeout/failure it logs and PROCEEDS
-        with the current session — it never aborts, because an abort cascades into
-        the runner's SKIPPED-NETWORK-STREAK and a stale session still usually
-        succeeds. Because we CDP-attach to the same keeper Chrome that the keeper
-        refreshes in-place, the live attached session picks up the new cookies.
+        for the cookies-file mtime to bump, then falls back to refresh_session.py.
+        Because we CDP-attach to the same keeper Chrome that the keeper refreshes
+        in-place, the live attached session picks up the new cookies.
+
+        Raises SessionStaleError if a critical cookie is still EXPIRED after both
+        refresh paths. This reverses the pre-2026-08-08 policy of always
+        proceeding: the old rationale ("a stale session still usually succeeds")
+        holds for cookies that are merely *expiring soon*, which is why only
+        hard-expired cookies abort here. It does not hold for expired ones —
+        those produced a Cloudflare wall and a guaranteed mid-run death 5-8
+        minutes later, on a serialized queue, with no error ever logged.
         """
         freshness = self._check_session_freshness(self.session_path)
         if hasattr(self, "_query_inst"):
@@ -1323,19 +1405,39 @@ class PerplexityCouncil:
                 self._query_inst["auto_refresh_path"] = "no_refresh"
             return
 
-        # Prefer refreshing THROUGH the keeper task (no popup) when its Chrome is
-        # serving CDP; else fall back to refresh_session.py (headful popup).
-        chrome_alive = False
-        try:
-            import urllib.request as _ur
-            with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
-                _ = _r.read()
-            chrome_alive = True
-        except Exception:
-            chrome_alive = False
+        # Prefer refreshing THROUGH the keeper task (no popup) when the KEEPER'S
+        # OWN Chrome is serving CDP; else fall back to refresh_session.py.
+        #
+        # Two gates, both added 2026-08-08 after this block caused a machine-wide
+        # research outage:
+        #
+        #   1. IDENTITY, not reachability. This used to be a bare urlopen against
+        #      port 9222 -- the exact "a reachable port is a trusted port" mistake
+        #      that `_start_via_cdp` was hardened against on 08-07. The /takeover
+        #      relay held 9222, so `chrome_alive` came back True, the keeper branch
+        #      was taken, and the refresh could never land. Note the two paths
+        #      disagreed: `_start_via_cdp` correctly REFUSED the same port seconds
+        #      earlier and fell back to a local launch. Fixing one call site and
+        #      not its twin is what turned a closed bug back into an open one.
+        #
+        #   2. TASK RUNNABILITY. `Start-ScheduledTask` against a Disabled task is a
+        #      silent no-op. PerplexitySessionKeeper had been Disabled since
+        #      2026-07-30, so the wait below could only ever time out. Every run
+        #      paid SESSION_KEEPER_WAIT_S for nothing before proceeding doomed.
+        keeper_ok, keeper_why = self._keeper_cdp_alive()
+        task_state = self._keeper_task_state() if keeper_ok else "n/a"
+        keeper_usable = keeper_ok and task_state in ("Ready", "Running", "Unknown")
+        refreshed_via_keeper = False
 
-        if chrome_alive:
-            _log("Keeper Chrome alive on CDP; firing PerplexitySessionKeeper to refresh in-place...")
+        if keeper_ok and not keeper_usable:
+            _log(f"Keeper Chrome present ({keeper_why}) but its scheduled task is "
+                 f"{task_state} — firing it would be a no-op; using refresh_session.py")
+        elif not keeper_ok:
+            _log(f"Keeper CDP not usable: {keeper_why} — using refresh_session.py")
+
+        if keeper_usable:
+            _log(f"Keeper verified on CDP ({keeper_why}); task={task_state}; "
+                 f"firing PerplexitySessionKeeper to refresh in-place...")
             if hasattr(self, "_query_inst"):
                 self._query_inst["auto_refresh_path"] = "keeper_task"
             try:
@@ -1355,21 +1457,55 @@ class PerplexityCouncil:
                         mtime_now = 0.0
                     if mtime_now > mtime_before:
                         _log("Keeper refreshed cookies (mtime bumped); session fresh")
-                        return
+                        refreshed_via_keeper = True
+                        break
                     _time.sleep(1)
-                # Most likely the keeper's own ~20-min auto-cycle is mid-run, so
-                # Task Scheduler refused our 2nd instance and no bump occurred.
-                _log(f"WARN: keeper-timeout-stale-proceed (no mtime bump in "
-                     f"{SESSION_KEEPER_WAIT_S}s) — proceeding with current session")
+                if not refreshed_via_keeper:
+                    # Most likely the keeper's own ~20-min auto-cycle is mid-run,
+                    # so Task Scheduler refused our 2nd instance. Do NOT proceed
+                    # on stale cookies -- fall through to the direct refresher.
+                    _log(f"WARN: keeper did not bump cookie mtime in "
+                         f"{SESSION_KEEPER_WAIT_S}s — falling back to refresh_session.py")
             except Exception as e:
-                _log(f"Keeper-task refresh failed: {type(e).__name__}: {e} — proceeding")
-        else:
-            _log("No keeper Chrome on CDP; auto-refresh ON — invoking refresh_session.py ...")
+                _log(f"Keeper-task refresh failed: {type(e).__name__}: {e} — "
+                     f"falling back to refresh_session.py")
+
+        if not refreshed_via_keeper:
             if hasattr(self, "_query_inst"):
-                self._query_inst["auto_refresh_path"] = "refresh_session_fallback"
+                self._query_inst["auto_refresh_path"] = (
+                    "keeper_then_refresh_session" if keeper_usable else "refresh_session_fallback"
+                )
+            _log("Auto-refresh ON — invoking refresh_session.py ...")
             refreshed = await self._auto_refresh_session()
-            _log("Auto-refresh succeeded" if refreshed
-                 else "WARNING: auto-refresh failed — proceeding with stale session")
+            _log("Auto-refresh succeeded" if refreshed else "WARNING: auto-refresh failed")
+
+        # Fail loud rather than submitting a doomed run. Only HARD-EXPIRED
+        # critical cookies abort: `expiring_soon` is a soft signal (the guard
+        # fires at SESSION_FRESHNESS_THRESHOLD_S = 8 min of remaining TTL, and a
+        # session with 7 minutes left still answers fine), whereas an expired
+        # pplx.session-id / __cf_bm means Cloudflare will serve a bot challenge
+        # Playwright cannot pass and the run WILL die -- just 5-8 minutes later,
+        # after it has consumed a slot on the serialized queue.
+        post = self._check_session_freshness(self.session_path)
+        still_expired = post.get("stale_critical") or []
+        if hasattr(self, "_query_inst"):
+            self._query_inst["cookies_stale_critical"] = still_expired
+        if not still_expired:
+            return
+        if os.environ.get("COUNCIL_ALLOW_STALE", "").lower() in ("1", "true", "yes", "on"):
+            _log("COUNCIL_ALLOW_STALE=1 — proceeding on expired cookies anyway")
+            return
+        detail_expired = ", ".join(f"{n}({age}m ago)" for n, age in still_expired)
+        _log(f"MONITOR-SIGNAL session_stale_abort {detail_expired}")
+        raise SessionStaleError(
+            f"Perplexity session cookies are EXPIRED and could not be refreshed "
+            f"[{detail_expired}]. Refresh path tried: "
+            f"keeper={'usable' if keeper_usable else f'unusable ({keeper_why}, task={task_state})'}, "
+            f"refresh_session.py=failed. Aborting before submit instead of burning a "
+            f"queue slot on a run that cannot succeed. Fix: run /cache-perplexity-session, "
+            f"or check that PerplexitySessionKeeper is Enabled and owns CDP port "
+            f"{KEEPER_CDP_PORT}."
+        )
 
     async def _load_session(self) -> None:
         """Load session from playwright-session.json + playwright-localstorage.json.
@@ -3344,7 +3480,24 @@ class PerplexityCouncil:
 
         try:
             _log("Starting Playwright browser...")
-            await self.start()
+            try:
+                await self.start()
+            except SessionStaleError as e:
+                # Abort cleanly instead of submitting a run that cannot succeed.
+                # Surfaced to the caller as a coded error (same shape as
+                # BROWSER_BUSY) so the MCP layer and the queue both see a real
+                # failure rather than a silent 5-8 minute death.
+                self._query_inst["chrome_path_used"] = "aborted_session_stale"
+                self._query_inst["exit_reason"] = "session_stale"
+                if not self._query_inst_emitted:
+                    _emit_query_instrumentation(self._query_inst)
+                    self._query_inst_emitted = True
+                _log(f"ABORT session_stale: {e}")
+                return {
+                    "error": str(e),
+                    "code": "SESSION_STALE",
+                    "step": "session_freshness",
+                }
 
             # CDP-attached sessions share the keeper's Chrome — no per-session
             # browser was launched, so the semaphore slot isn't actually
