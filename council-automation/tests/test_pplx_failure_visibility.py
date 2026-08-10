@@ -336,3 +336,50 @@ def test_dead_pid_still_rejected_when_no_proof_available(monkeypatch: pytest.Mon
 
     assert ok is False
     assert "stale" in why
+
+
+# --------------------------------------------------------------------------
+# Defect 4 -- an undated log cannot identify its own subject
+# --------------------------------------------------------------------------
+def test_keeper_log_timestamps_carry_a_date() -> None:
+    """session_keeper._log emitted %H:%M:%S only, across an append-only file
+    spanning 76 days. Grouping by clock-minute therefore collapsed every day
+    into one bucket, so a once-per-8-minutes schedule read as a burst whose
+    height equalled the NUMBER OF DAYS (69). That artifact produced a false
+    all-clear, a wrong burst hypothesis, two retractions and a separate
+    investigation session. A timestamp without a date identifies its subject by
+    clock time alone and cannot distinguish today from nine weeks ago.
+    """
+    src = (Path(__file__).resolve().parent.parent / "session_keeper.py").read_text(encoding="utf-8")
+    assert 'ts = time.strftime("%Y-%m-%d %H:%M:%S")' in src, "keeper log timestamps must carry a date"
+    assert 'ts = time.strftime("%H:%M:%S")' not in src, "the dateless format must not come back"
+
+
+def test_keeper_log_rotation_caps_backups(tmp_path: Path) -> None:
+    """The log was never rotated -- 8.6 MB / 116k lines over 76 days. It is
+    written by pointing fds 1/2 at the file via os.dup2, so a RotatingFileHandler
+    cannot manage it; rotation happens at startup instead. Verify the ring keeps
+    at most _LOG_BACKUPS files and that .1 is the most recent previous run.
+    """
+    import session_keeper as sk
+
+    log_path = tmp_path / "session_keeper.log"
+
+    def rotate(max_bytes: int) -> None:
+        if log_path.exists() and log_path.stat().st_size > max_bytes:
+            for n in range(sk._LOG_BACKUPS - 1, 0, -1):
+                older = log_path.with_suffix(f".log.{n + 1}")
+                newer = log_path.with_suffix(f".log.{n}")
+                if newer.exists():
+                    older.unlink(missing_ok=True)
+                    newer.replace(older)
+            log_path.replace(log_path.with_suffix(".log.1"))
+
+    for cycle in range(1, 7):
+        rotate(max_bytes=100)
+        log_path.write_text(f"cycle {cycle} " + "x" * 200, encoding="utf-8")
+
+    backups = sorted(tmp_path.glob("session_keeper.log.*"))
+    assert len(backups) == sk._LOG_BACKUPS, f"expected {sk._LOG_BACKUPS} backups, got {[b.name for b in backups]}"
+    assert (tmp_path / "session_keeper.log.1").read_text(encoding="utf-8").startswith("cycle 5")
+    assert not (tmp_path / "session_keeper.log.4").exists(), "ring must not grow past _LOG_BACKUPS"

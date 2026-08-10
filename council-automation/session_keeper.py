@@ -47,6 +47,10 @@ from pathlib import Path
 #     SIGBREAK on Windows so we don't die when the parent console terminates.
 #   - Keep an idle stdin reader task pinned in the event loop so the loop never
 #     thinks it has no work to do.
+_LOG_MAX_BYTES = 5 * 1024 * 1024   # rotate session_keeper.log past ~5 MB
+_LOG_BACKUPS = 3                   # keep .log.1 .. .log.3
+
+
 def _harden_for_windows_daemon() -> None:
     """Daemonize stdio at the OS file-descriptor level so children inherit sanely.
 
@@ -79,6 +83,24 @@ def _harden_for_windows_daemon() -> None:
     try:
         log_path = Path.home() / ".claude" / "logs" / "session_keeper.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Size-based rotation AT STARTUP. The log is written by pointing fds 1/2
+        # at the file via os.dup2, so a logging.RotatingFileHandler cannot manage
+        # it -- rotation has to happen before the descriptors are opened. A
+        # one-shot process that runs every ~8 minutes gives us a natural, safe
+        # rotation point. Before this, the file had grown to 8.6 MB / 116k lines
+        # over 76 days without ever rotating.
+        # Best-effort: two keeper invocations overlapping could race on the
+        # rename, and a failed rotation must never stop the keeper from starting.
+        try:
+            if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+                for n in range(_LOG_BACKUPS - 1, 0, -1):
+                    older, newer = log_path.with_suffix(f".log.{n + 1}"), log_path.with_suffix(f".log.{n}")
+                    if newer.exists():
+                        older.unlink(missing_ok=True)
+                        newer.replace(older)
+                log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
+            pass
         log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         os.dup2(log_fd, 1)
         os.dup2(log_fd, 2)
@@ -142,7 +164,16 @@ DEFAULT_CDP_PORT = int(os.environ.get("COUNCIL_KEEPER_CDP_PORT", "9223"))
 
 
 def _log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
+    # Date REQUIRED, not cosmetic. Until 2026-08-09 this emitted %H:%M:%S only,
+    # and the log is append-only across months. Grouping lines by clock-minute
+    # therefore collapses every day in the file into the same bucket, so a
+    # once-per-8-minutes schedule reads as a burst whose height equals the
+    # NUMBER OF DAYS present. That artifact cost a full evening: it produced a
+    # false all-clear, then a "69 navigations in one minute" burst hypothesis,
+    # then a retraction of the retraction, then a whole separate investigation
+    # session -- all from a timestamp that identifies its subject by clock time
+    # alone and cannot distinguish today from nine weeks ago.
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[keeper {ts}] {msg}", flush=True)
 
 
