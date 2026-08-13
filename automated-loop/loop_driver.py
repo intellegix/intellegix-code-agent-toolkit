@@ -95,6 +95,7 @@ class LoopDriver:
             retry_config=config.retry,
             research_timeout=config.perplexity.research_timeout_seconds,
             headful=config.perplexity.headful,
+            provider=config.perplexity.provider,
             perplexity_mode=config.perplexity.perplexity_mode,
             exploration_config=config.exploration,
             verification_config=config.verification,

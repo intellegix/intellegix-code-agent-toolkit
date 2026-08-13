@@ -72,10 +72,11 @@ class LimitsConfig(BaseModel):
 
 
 class PerplexityConfig(BaseModel):
-    """Perplexity research settings (Playwright browser automation)."""
+    """Research provider settings."""
 
     research_timeout_seconds: int = Field(default=600, ge=60)
     headful: bool = Field(default=True)
+    provider: str = Field(default="perplexity")
     perplexity_mode: str = Field(default="research")
 
 

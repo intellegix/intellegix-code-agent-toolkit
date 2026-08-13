@@ -187,6 +187,7 @@ The loop uses sensible defaults and works out of the box. For customization, cre
   "perplexity": {
     "research_timeout_seconds": 600,
     "headful": true,
+    "provider": "perplexity",
     "perplexity_mode": "research"
   },
   "claude": {
@@ -202,6 +203,15 @@ The loop uses sensible defaults and works out of the box. For customization, cre
   }
 }
 ```
+
+To use You.com instead of the default Playwright-based Perplexity flow, set:
+
+```bash
+export AUTOMATED_LOOP_RESEARCH_PROVIDER=youcom
+export YDC_API_KEY=your-key-here
+```
+
+The integration stays optional. If the provider is not set, existing Perplexity behavior remains unchanged.
 
 All fields are optional — unspecified values use defaults. The `"model": "sonnet"` default is recommended for most workloads.
 
