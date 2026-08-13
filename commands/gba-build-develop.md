@@ -36,7 +36,7 @@ STAGE 6: SHIP ─── Full playthrough, profiling, production audit, docs
 - **Butano** (default engine) or **libtonc** — `BUTANO_PATH` set if using Butano
 - **mGBA** running with Lua MCP server on port 61337
 - **git** initialized in project directory
-- **loop_driver.py** at `"C:\Users\AustinKidwell\ASR Dropbox\Austin Kidwell\04_ResearchAnalysis\automated claude\automated-loop\loop_driver.py"`
+- **loop_driver.py** at ``~/.claude/automated-loop/loop_driver.py``
 - MCP server registered in `~/.claude/settings.json`
 
 ---

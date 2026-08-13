@@ -1,7 +1,7 @@
 # /gba-ai-full — Full AI Behavior Regression Test
 
 ## MANDATORY FIRST STEP
-Read `docs/gba-claude-guide.md` from `C:\Users\AustinKidwell\ASR Dropbox\Austin Kidwell\04_ResearchAnalysis\pokefirered-master\pokefirered-master` completely before any MCP tool call.
+Read `docs/gba-claude-guide.md` from `$GBA_DECOMP_DIR` (set this to your pokefirered decomp checkout) completely before any MCP tool call.
 
 ## 5 ABSOLUTE RULES
 1. VERIFY state before every action (screenshot + callback2)

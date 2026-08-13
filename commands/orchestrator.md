@@ -399,7 +399,7 @@ gotchas, and build commands. Do NOT write CLAUDE.md from shallow context alone.
 ### Step 1: Build Launch Command
 
 ```
-python "C:\Users\AustinKidwell\ASR Dropbox\Austin Kidwell\04_ResearchAnalysis\automated claude\automated-loop\loop_driver.py" --project "<target-project-path>" --initial-prompt "Read CLAUDE.md first — it contains the current roadmap with phases and their status. Implement the first phase marked TODO. Do NOT output PROJECT_COMPLETE unless every phase in CLAUDE.md is marked COMPLETE." --verbose
+python "$HOME/.claude/automated-loop/loop_driver.py" --project "<target-project-path>" --initial-prompt "Read CLAUDE.md first — it contains the current roadmap with phases and their status. Implement the first phase marked TODO. Do NOT output PROJECT_COMPLETE unless every phase in CLAUDE.md is marked COMPLETE." --verbose
 ```
 
 Add optional flags based on context:
