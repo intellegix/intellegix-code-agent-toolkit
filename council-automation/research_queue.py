@@ -63,6 +63,15 @@ POLL_S = 1.5
 MAX_WAIT_S = int(os.environ.get("RESEARCH_QUEUE_MAX_WAIT", "1200"))
 ACTIVITY_LOG_LOCK_TIMEOUT_S = 10  # exposed for tests (monkeypatchable)
 SNAPSHOT_LOCK_TIMEOUT_S = 5  # exposed for tests (monkeypatchable)
+# os.replace() onto a destination with a concurrent open handle raises
+# PermissionError (WinError 5 / ERROR_ACCESS_DENIED) on Windows. The snapshot
+# FileLock serializes writers but cannot exclude readers (monitor, queue
+# daemon, MCP status tool, other runners checking their position), so the
+# swap is retried a few times with a short backoff to ride out that transient
+# sharing violation. 12 * 25ms = 300ms worst case; readers hold the file for
+# microseconds so the swap almost always succeeds on the first or second try.
+_ATOMIC_REPLACE_RETRIES = 12  # exposed for tests (monkeypatchable)
+_ATOMIC_REPLACE_BACKOFF_S = 0.025  # exposed for tests (monkeypatchable)
 STATS_LOOKBACK_LINES = 5000  # tail bound for today's-stats scan (see _compute_today_stats)
 
 # Windows OpenProcess() access right sufficient only to query existence --
@@ -130,7 +139,24 @@ def _atomic_write(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
-        os.replace(tmp_name, path)
+        # os.replace is atomic, but on Windows it raises PermissionError
+        # (WinError 5) when the destination has a concurrent open handle -- a
+        # reader (monitor / queue daemon / MCP status tool / another runner
+        # checking its position) holding the file open at the instant of the
+        # swap. That sharing violation is transient (readers hold it for
+        # microseconds), so retry the swap a few times with a short backoff
+        # before surfacing the error. Without this, a lost race silently drops
+        # a run's completion/instrumentation write, or aborts the caller's run
+        # outright (see publish_snapshot: WinError 5 is not the Timeout it
+        # catches, so it would otherwise propagate).
+        for _attempt in range(_ATOMIC_REPLACE_RETRIES):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError:
+                if _attempt == _ATOMIC_REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(_ATOMIC_REPLACE_BACKOFF_S)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -316,6 +342,46 @@ def gc_dead_tickets() -> None:
                 f.unlink()
             except OSError as exc:
                 logger.debug("gc_dead_tickets: could not unlink %s (%s)", f, exc)
+                continue
+            # A reclaimed ticket is a run that DIED WITHOUT SAYING SO -- the only
+            # trace it ever leaves. `acquire_slot`'s `except BaseException` logs
+            # an "error" event for anything that raises inside the with-block,
+            # but it cannot run at all when the process is killed outright, and
+            # that is the normal end for a research run: the MCP layer calls
+            # execFileAsync(..., {timeout: 540_000}) and Node's timeout kill on
+            # Windows is TerminateProcess -- no signal, no unwinding, no
+            # finally-blocks. So the activity log recorded `started` and nothing
+            # else, `errors_today` stayed 0, and two machine-wide outages in 24h
+            # (2026-08-07, 2026-08-08) both had to be discovered by a session
+            # tripping over them instead of by the monitor. Logging the reclaim
+            # is what closes that hole: it is the one moment another process can
+            # observe that the run is gone. See also the silent-drop analysis in
+            # memory `reading-queue-feeds-correctly`.
+            #
+            # Emitted only by the process that WON the unlink race (the loser
+            # gets OSError and `continue`s above), so exactly one event per run.
+            try:
+                log_event(
+                    "dropped",
+                    d.get("run_id", "?"),
+                    d.get("session", "?"),
+                    int(d.get("seq", -1)),
+                    d.get("query_preview", ""),
+                    d.get("mode", "research"),
+                    error=(
+                        "runner process died without logging an outcome "
+                        f"(pid={d.get('pid')} {'alive-but-heartbeat-stale' if alive else 'dead'})"
+                    ),
+                    ticket_state=d.get("state", "unknown"),
+                    pid_alive=bool(alive),
+                    heartbeat_age_s=round(now - d.get("heartbeat_at", now), 1),
+                    duration_s=(
+                        round(now - d["active_since"], 1)
+                        if isinstance(d.get("active_since"), (int, float)) else None
+                    ),
+                )
+            except Exception as exc:  # never let bookkeeping break the GC
+                logger.debug("gc_dead_tickets: could not log dropped event (%s)", exc)
 
 
 def live_tickets() -> List[Tuple[Path, Dict[str, Any]]]:
@@ -360,9 +426,12 @@ def log_event(
 ) -> None:
     """Append one JSON line describing a queue transition to ACTIVITY_LOG.
 
-    Events: enqueued | started | completed | error | timeout. Extra
+    Events: enqueued | started | completed | error | timeout | dropped. Extra
     keyword args (wait_s, duration_s, status, error, ...) are merged
     directly into the record.
+
+    `dropped` is emitted by `gc_dead_tickets()`, not by the run itself -- it is
+    the outcome for a run whose process was killed before it could report one.
     """
     ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
     record: Dict[str, Any] = {
@@ -428,20 +497,32 @@ def _is_same_local_day(ts: float, now: float) -> bool:
     return (a.tm_year, a.tm_yday) == (b.tm_year, b.tm_yday)
 
 
-def _compute_today_stats(now: float) -> Tuple[int, int]:
-    """Compute (total_today, errors_today) from the activity log.
+#: Activity-log events that mean "this run did not deliver a result". `dropped`
+#: is here because a killed runner is a failed run: excluding it is precisely
+#: what let `errors_today: 0` coexist with a total research outage.
+FAILURE_EVENTS = ("error", "timeout", "dropped")
+
+
+def _compute_today_stats(now: float) -> Tuple[int, int, Optional[Dict[str, Any]]]:
+    """Compute (total_today, errors_today, last_failure) from the activity log.
 
     `total_today` counts DISTINCT RUNS (not raw events) that started today,
-    identified by a `started` event's run_id. `errors_today` counts `error`
-    and `timeout` events logged today. Bounded to the last
-    STATS_LOOKBACK_LINES lines of the activity log for performance (this is
-    read on every publish_snapshot() call, which can fire every ~1.5s per
-    waiting session) -- more than sufficient to cover a single day's events
-    under normal usage.
+    identified by a `started` event's run_id. `errors_today` counts
+    FAILURE_EVENTS logged today. `last_failure` is a compact summary of the
+    most recent one (or None), so a caller reading only the snapshot can see
+    WHAT broke without opening the activity log -- the MCP
+    `research_queue_status` tool previously exposed a bare count, which reads
+    as "healthy" the moment the count is wrong.
+
+    Bounded to the last STATS_LOOKBACK_LINES lines of the activity log for
+    performance (this is read on every publish_snapshot() call, which can fire
+    every ~1.5s per waiting session) -- more than sufficient to cover a single
+    day's events under normal usage.
     """
     events = _read_activity_events(limit=STATS_LOOKBACK_LINES)
     started_run_ids_today: set[str] = set()
     errors_today = 0
+    last_failure: Optional[Dict[str, Any]] = None
     for e in events:
         ts = e.get("ts")
         if not isinstance(ts, (int, float)) or not _is_same_local_day(ts, now):
@@ -451,9 +532,17 @@ def _compute_today_stats(now: float) -> Tuple[int, int]:
             run_id = e.get("run_id")
             if run_id:
                 started_run_ids_today.add(run_id)
-        elif event in ("error", "timeout"):
+        elif event in FAILURE_EVENTS:
             errors_today += 1
-    return len(started_run_ids_today), errors_today
+            last_failure = {
+                "event": event,
+                "run_id": e.get("run_id"),
+                "session": e.get("session"),
+                "ts": ts,
+                "age_s": round(now - ts, 1),
+                "error": (str(e.get("error") or ""))[:300],
+            }
+    return len(started_run_ids_today), errors_today, last_failure
 
 
 def publish_snapshot(my_seq: Optional[int] = None) -> None:
@@ -507,7 +596,7 @@ def publish_snapshot(my_seq: Optional[int] = None) -> None:
         item["position"] = i
 
     recent = _read_recent_activity(limit=20)
-    total_today, errors_today = _compute_today_stats(now)
+    total_today, errors_today, last_failure = _compute_today_stats(now)
 
     snapshot = {
         "version": time.time_ns(),
@@ -519,6 +608,7 @@ def publish_snapshot(my_seq: Optional[int] = None) -> None:
             "depth": len(queued) + (1 if active else 0),
             "total_today": total_today,
             "errors_today": errors_today,
+            "last_failure": last_failure,
         },
     }
     text = json.dumps(snapshot)
