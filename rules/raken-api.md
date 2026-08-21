@@ -16,7 +16,7 @@ When working on any Raken API-related file, these rules apply:
 
 2. **Check for compiled cache**: The compiled reference lives at:
    ```
-   C:/Users/AustinKidwell/ASR Dropbox/Austin Kidwell/08_Financial_PayrollOperations/Certified Payroll/Raken API/raken-api-reference.md
+   $RAKEN_REFERENCE_DIR/raken-api-reference.md
    ```
    If this file does not exist, prompt the user to run `/raken-api` to generate it.
 

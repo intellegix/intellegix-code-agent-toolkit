@@ -50,7 +50,7 @@ Error handling: `patterns/PYTHON_PATTERNS.md#result-pattern`; Validation: `patte
 - Full checklist: `patterns/SECURITY_CHECKLIST.md`
 
 ## Git Workflow
-- Branches: `feature/IGX-123-desc` | `bugfix/ASR-456-fix` | `hotfix/critical-patch`
+- Branches: `feature/IGX-123-desc` | `bugfix/PRJ-456-fix` | `hotfix/critical-patch`
 - Commits: `feat(scope): add feature` | `fix(scope): resolve bug` | `refactor(scope): improve code`
 - Pre-commit: type check (`mypy src/` or `npm run type-check`); run affected tests; no hardcoded secrets; new env vars in `.env.example`
 
