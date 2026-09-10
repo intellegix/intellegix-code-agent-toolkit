@@ -19,6 +19,7 @@ class TestWorkflowConfig:
         assert config.limits.max_iterations == 50
         assert config.limits.timeout_seconds == 300
         assert config.perplexity.research_timeout_seconds == 600
+        assert config.perplexity.provider == "perplexity"
         assert config.perplexity.headful is True
         assert config.perplexity.perplexity_mode == "research"
         assert config.claude.model == "sonnet"
@@ -95,12 +96,13 @@ class TestLoadConfig:
     def test_load_partial_config_fills_defaults(self, config_dir: Path) -> None:
         config_file = config_dir / "config.json"
         config_file.write_text(
-            json.dumps({"perplexity": {"perplexity_mode": "labs"}}),
+            json.dumps({"perplexity": {"provider": "youcom", "perplexity_mode": "labs"}}),
             encoding="utf-8",
         )
 
         result = load_config(config_file)
         assert result.success
+        assert result.data.perplexity.provider == "youcom"
         assert result.data.perplexity.perplexity_mode == "labs"
         assert result.data.limits.max_iterations == 50  # default
 

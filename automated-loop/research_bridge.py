@@ -10,10 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -234,7 +237,7 @@ RETRYABLE_ERRORS = {"TIMEOUT", "PLAYWRIGHT_ERROR", "PARSE_ERROR"}
 
 
 class ResearchBridge:
-    """Queries Perplexity via Playwright browser automation with project context."""
+    """Queries a research provider with project context."""
 
     def __init__(
         self,
@@ -242,6 +245,7 @@ class ResearchBridge:
         retry_config: Optional[RetryConfig] = None,
         research_timeout: int = 600,
         headful: bool = True,
+        provider: str = "perplexity",
         perplexity_mode: str = "research",
         exploration_config: Optional[ExplorationConfig] = None,
         verification_config: Optional[VerificationConfig] = None,
@@ -251,6 +255,7 @@ class ResearchBridge:
         self.retry_config = retry_config or RetryConfig()
         self.research_timeout = research_timeout
         self.headful = headful
+        self.provider = provider
         self.perplexity_mode = perplexity_mode
         self.exploration_config = exploration_config or ExplorationConfig()
         self.verification_config = verification_config or VerificationConfig()
@@ -443,10 +448,13 @@ class ResearchBridge:
         codebase_context: Optional[dict[str, str]] = None,
         focus_area: Optional[str] = None,
     ) -> Result[ResearchResult]:
-        """Execute a single research query via Playwright browser automation (no retry)."""
+        """Execute a single research query (no retry)."""
         query_text = self.build_query(
             extra_context, codebase_context=codebase_context, focus_area=focus_area,
         )
+
+        if self.provider == "youcom":
+            return self._single_youcom_query(query_text)
 
         try:
             cmd = [
@@ -503,6 +511,111 @@ class ResearchBridge:
             )
         except Exception as e:
             return Result.fail(f"Research query failed: {e}", "QUERY_ERROR")
+
+    def _single_youcom_query(self, query_text: str) -> Result[ResearchResult]:
+        """Execute a single research query via You.com Research API."""
+        api_key = os.environ.get("YDC_API_KEY")
+        if not api_key:
+            return Result.fail(
+                "YDC_API_KEY is required when AUTOMATED_LOOP_RESEARCH_PROVIDER=youcom",
+                "MISSING_API_KEY",
+            )
+
+        payload = json.dumps({
+            "input": query_text,
+            "research_effort": "standard",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.you.com/v1/research",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.research_timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            output = data.get("output", {})
+            content = output.get("content", "")
+            if not content:
+                return Result.fail("Empty response from You.com research", "PARSE_ERROR")
+
+            sources = output.get("sources") or data.get("sources") or []
+            response = self._format_youcom_response(content, sources)
+
+            research_result = ResearchResult(
+                query=query_text[:500],
+                response=response,
+                model="youcom-research-standard",
+            )
+            self._save_result(research_result)
+            return Result.ok(research_result)
+        except urllib.error.HTTPError as e:
+            details = e.read().decode("utf-8", errors="replace")
+            return Result.fail(
+                f"You.com API request failed ({e.code}): {details}",
+                "API_ERROR",
+            )
+        except urllib.error.URLError as e:
+            return Result.fail(f"You.com API request failed: {e}", "QUERY_ERROR")
+        except json.JSONDecodeError as e:
+            return Result.fail(f"Invalid JSON from You.com API: {e}", "PARSE_ERROR")
+        except TimeoutError:
+            return Result.fail(
+                f"You.com research timed out ({self.research_timeout}s)", "TIMEOUT"
+            )
+        except Exception as e:
+            return Result.fail(f"You.com research query failed: {e}", "QUERY_ERROR")
+
+    def _format_youcom_response(self, content: str, sources: object) -> str:
+        """Append a readable source list to You.com research output.
+
+        You.com returns inline citation markers in the synthesized answer, plus
+        a structured `sources` array. Keeping both gives readers the answer and
+        the provenance without forcing them to infer what the markers mean.
+        """
+        normalized_sources = self._normalize_youcom_sources(sources)
+        if not normalized_sources:
+            return content
+
+        lines = [content.rstrip(), "", "## Sources"]
+        for index, source in enumerate(normalized_sources, start=1):
+            title = source.get("title") or source.get("url") or f"Source {index}"
+            url = source.get("url")
+            if url and title != url:
+                lines.append(f"{index}. {title} - {url}")
+            elif url:
+                lines.append(f"{index}. {url}")
+            else:
+                lines.append(f"{index}. {title}")
+
+        return "\n".join(lines).rstrip()
+
+    def _normalize_youcom_sources(self, sources: object) -> list[dict[str, str]]:
+        """Normalize the You.com `sources` payload into simple display rows."""
+        if not isinstance(sources, list):
+            return []
+
+        normalized: list[dict[str, str]] = []
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+
+            row: dict[str, str] = {}
+            title = item.get("title")
+            url = item.get("url")
+            if isinstance(title, str) and title.strip():
+                row["title"] = title.strip()
+            if isinstance(url, str) and url.strip():
+                row["url"] = url.strip()
+            if row:
+                normalized.append(row)
+
+        return normalized
 
     def verify_plan(
         self,
@@ -714,7 +827,7 @@ class ResearchBridge:
 
 def main() -> None:
     """CLI entry point for standalone research bridge usage."""
-    parser = argparse.ArgumentParser(description="Query Perplexity for project next steps")
+    parser = argparse.ArgumentParser(description="Query a research provider for project next steps")
     parser.add_argument("--project", default=".", help="Project directory path")
     parser.add_argument(
         "--mode", default="playwright", choices=["playwright"],
@@ -722,6 +835,12 @@ def main() -> None:
     )
     parser.add_argument("--context", default=None, help="Extra context to include")
     parser.add_argument("--headful", action="store_true", help="Run browser in visible mode")
+    parser.add_argument(
+        "--provider",
+        default=os.environ.get("AUTOMATED_LOOP_RESEARCH_PROVIDER", "perplexity"),
+        choices=["perplexity", "youcom"],
+        help="Research provider to use",
+    )
     parser.add_argument(
         "--perplexity-mode", default="research",
         choices=["research", "council", "labs"],
@@ -741,6 +860,7 @@ def main() -> None:
     bridge = ResearchBridge(
         args.project,
         headful=args.headful,
+        provider=args.provider,
         perplexity_mode=args.perplexity_mode,
     )
     result = bridge.query(extra_context=args.context)

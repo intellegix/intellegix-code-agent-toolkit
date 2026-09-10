@@ -202,6 +202,46 @@ class TestResearchBridge:
         assert not result.success
         assert result.error_code == "PARSE_ERROR"
 
+    @patch.dict("os.environ", {}, clear=True)
+    def test_youcom_requires_api_key(self, research_project_dir: Path) -> None:
+        bridge = ResearchBridge(research_project_dir, provider="youcom")
+
+        result = bridge.query()
+
+        assert not result.success
+        assert result.error_code == "MISSING_API_KEY"
+
+    @patch.dict("os.environ", {"YDC_API_KEY": "test-key"}, clear=True)
+    @patch("research_bridge.urllib.request.urlopen")
+    def test_successful_youcom_query(
+        self, mock_urlopen: MagicMock, research_project_dir: Path,
+    ) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps({
+            "output": {
+                "content": "Next steps: use You.com research [[1]]",
+                "content_type": "text",
+                "sources": [
+                    {
+                        "title": "You.com Research API docs",
+                        "url": "https://docs.you.com/",
+                    }
+                ],
+            }
+        }).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = response
+
+        bridge = ResearchBridge(research_project_dir, provider="youcom")
+        result = bridge.query()
+
+        assert result.success
+        assert result.data is not None
+        assert "You.com research" in result.data.response
+        assert "## Sources" in result.data.response
+        assert "You.com Research API docs" in result.data.response
+        assert "https://docs.you.com/" in result.data.response
+        assert result.data.model == "youcom-research-standard"
+
 
 class TestRetryAndCircuitBreaker:
     """Tests for retry, backoff, and circuit breaker logic."""
