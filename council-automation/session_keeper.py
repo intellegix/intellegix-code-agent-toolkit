@@ -320,6 +320,62 @@ async def _save_cookies_and_storage(context, page) -> int:
     return len(filtered)
 
 
+# next-auth's session endpoint is the authoritative answer to "is this browser
+# signed in": it returns the session object when there is one and a bare {} when
+# there is not. Unlike a DOM selector it cannot drift when Perplexity restyles
+# the page, and it cannot be fooled by UI that renders for signed-out visitors.
+import datetime as _dt
+
+AUTH_SESSION_URL = "https://www.perplexity.ai/api/auth/session"
+
+
+async def _ask_perplexity_whether_signed_in(page) -> bool | None:
+    """True/False if the auth endpoint answered, None if it could not be reached.
+
+    None is deliberately distinct from False: "I could not tell" must never be
+    reported as "signed out", and must never be reported as "signed in" either.
+    """
+    try:
+        payload = await page.evaluate(
+            """async (url) => {
+                // Vary the URL, not just the cache mode: `cache: 'no-store'`
+                // only governs the browser's own HTTP cache, while a CDN edge
+                // cache or a service worker's Cache Storage keys on the URL and
+                // would happily replay a stale 200 for either.
+                const bust = url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
+                const response = await fetch(bust, {
+                    credentials: 'include',
+                    cache: 'no-store',
+                });
+                if (!response.ok) return null;
+                return await response.json();
+            }""",
+            AUTH_SESSION_URL,
+        )
+    except Exception as exc:
+        _log(f"Auth endpoint unreachable ({type(exc).__name__}: {exc})")
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not payload:
+        return False
+
+    # A non-empty body is not proof of a live session. next-auth computes
+    # `expires` from the JWT at issuance, so it can already be in the past.
+    expires = payload.get("expires")
+    if isinstance(expires, str):
+        try:
+            deadline = _dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        except ValueError:
+            _log(f"Auth endpoint returned an unparseable expires ({expires!r}); "
+                 f"treating the session as UNVERIFIED rather than guessing.")
+            return None
+        if deadline <= _dt.datetime.now(_dt.timezone.utc):
+            _log(f"Auth endpoint returned a session that expired at {expires}.")
+            return False
+    return True
+
+
 async def _navigate_and_warm(page) -> bool:
     """Navigate to perplexity.ai, wait for auth hydration, return logged_in."""
     try:
@@ -328,9 +384,28 @@ async def _navigate_and_warm(page) -> bool:
         _log(f"Navigation failed: {e}")
         return False
     await page.wait_for_timeout(3000)
+
+    # 2026-08-22: ask the server, not the page. This used to return True on the
+    # mere presence of `#ask-input`, which Perplexity renders to signed-out
+    # visitors -- so a dead session was certified healthy every cycle and its
+    # expired cookies were written over the saved jar. See the patch notes.
+    signed_in = await _ask_perplexity_whether_signed_in(page)
+    if signed_in is True:
+        return True
+    if signed_in is False:
+        _log("Auth check FAILED: SIGNED OUT server-side (/api/auth/session "
+             "returned an empty session). Not persisting cookies -- a human must "
+             "sign in; refreshing cannot revive a session the server has dropped.")
+        _log("MONITOR-SIGNAL perplexity_signed_out")
+        return False
+
+    # Endpoint unreachable: fall back to the old selector probe, but say plainly
+    # that this is unverified rather than reporting a confirmed login.
     for selector in ("#ask-input", "textarea[placeholder]", "[data-testid='ask-input']"):
         try:
             await page.wait_for_selector(selector, timeout=5000)
+            _log(f"Auth UNVERIFIED: could not reach the auth endpoint; proceeding "
+                 f"on the presence of {selector}, which also renders when signed out.")
             return True
         except Exception:
             continue
@@ -484,7 +559,24 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
     browser = None
     context = None
     try:
-        browser = await pw.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+        # 2026-08-22: one hung renderer in this very Chrome made connect_over_cdp
+        # time out 54 times in a row over six hours, silently taking the whole
+        # research pipeline down -- and the queue monitor's remediation is to run
+        # THIS script, so without the sweep the auto-fix could never work either.
+        endpoint = f"http://127.0.0.1:{cdp_port}"
+        try:
+            from cdp_health import sweep_cdp_endpoint
+
+            health = await sweep_cdp_endpoint(endpoint, log=_log)
+            if health.closed_any:
+                _log(
+                    "reaped wedged/leaked targets before attach: "
+                    f"hung={len(health.hung_closed)} junk={len(health.junk_closed)}"
+                )
+        except Exception as sweep_error:
+            _log(f"cdp_health sweep skipped ({type(sweep_error).__name__}: {sweep_error})")
+
+        browser = await pw.chromium.connect_over_cdp(endpoint, timeout=45_000)
         contexts = browser.contexts
         if not contexts:
             _log("ERROR: connect_over_cdp returned 0 contexts")
@@ -492,19 +584,33 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         context = contexts[0]
         _log(f"Connected via CDP. {len(contexts)} context(s), {len(context.pages)} page(s)")
 
-        # Inject cookies from playwright-session.json into the default context.
-        await context.add_cookies(old_cookies)
-        _log(f"Injected {len(old_cookies)} cookies into CDP context")
-
         # Use or open a page in the keeper context.
         if context.pages:
             page = context.pages[0]
         else:
             page = await context.new_page()
 
-        # Initial warm + cookie write.
+        # 2026-08-22: probe the LIVE context BEFORE injecting anything.
+        # This used to inject the saved jar first, unconditionally. When that jar
+        # was stale -- precisely the case this daemon exists to catch -- it
+        # overwrote a healthy live session with dead cookies, saw the browser go
+        # signed-out as a direct result, and persisted that. The keeper was the
+        # thing killing the session, in a loop, while logging success.
+        # Injection is a REPAIR, so it only makes sense once the live context has
+        # been shown to be broken.
         _log("Navigating to perplexity.ai (initial warm)...")
         logged_in = await _navigate_and_warm(page)
+
+        if logged_in:
+            _log("Live context is already signed in — NOT injecting the saved jar; "
+                 "it cannot be fresher than what the browser is already holding.")
+        else:
+            _log(f"Live context is not signed in — injecting {len(old_cookies)} saved "
+                 f"cookies as a repair attempt, then re-checking.")
+            await context.add_cookies(old_cookies)
+            logged_in = await _navigate_and_warm(page)
+            _log("Repair from saved cookies " + ("succeeded" if logged_in else "failed"))
+
         if not logged_in:
             _log("ERROR: not logged in — re-run `python council_browser.py --save-session`")
             sys.exit(1)

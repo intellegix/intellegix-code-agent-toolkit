@@ -38,13 +38,32 @@ export const CONFIG = {
     perplexityAuto: 600_000,   // automate_perplexity_task (10 min max)
   },
 
-  // Relay-specific timeouts
-  relayReconnectDelay: 3_000,
+  // Relay-specific timeouts.
+  // relayReconnectDelay is the BASE of a full-jitter exponential backoff, not a
+  // fixed sleep. It was a constant 3_000 until 2026-08-22, which made every
+  // relay client retry in the same millisecond — ~20 processes logging the
+  // identical ECONNREFUSED 10,415 times in 24h. Each of those drops removed and
+  // re-added this server's tools, and a tool-list change invalidates the entire
+  // prompt cache, so the herd was costing ~$400/day. Small base = fast recovery
+  // once an owner exists; the cap bounds the retry rate while none does.
+  relayReconnectDelay: 250,
+  relayReconnectCapMs: 8_000,
   ppidPollInterval: 10_000,
 
   // WS bridge zombie/reconnect detection
   appMsgTimeout: 45_000,         // zombie detection: 2 missed 20s keepalives
   waitForBrowserTimeout: 5_000,  // max wait for browser client reconnect
+
+  // Grace period before a disconnected relay's tabs are closed.
+  // A relay disconnect used to close that session's tabs IMMEDIATELY. Measured
+  // 2026-09-10: the intellegix-relay lane's server process exited at 12:43:06 and
+  // a replacement connected 2.3s later, so the cleanup destroyed a tab the caller
+  // was still working with. The caller then read the (accurate) tab list, did not
+  // find its tab, and concluded the page was never open — which is the incident in
+  // STALE-TABS-AND-SINGLE-BROWSER-BLINDNESS-EVIDENCE-2026-09-10.md. Deferring the
+  // cleanup lets a restart reclaim its own tabs. A genuinely-gone session just has
+  // its tabs closed this many ms later.
+  sessionCleanupGrace: 45_000,
 };
 
 // ---------------------------------------------------------------------------

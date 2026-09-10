@@ -168,6 +168,38 @@ class SessionSemaphore:
         """Count active slot files (after cleanup)."""
         return len(list(self.sessions_dir.glob("slot-*.lock")))
 
+    def _describe_holders(self) -> str:
+        """Describe every held slot as 'slot=N pid=P age=Ts alive=yes|no'.
+
+        Purely diagnostic. This is what a BROWSER_BUSY message carries, so a
+        reader can tell real contention from a wedged holder without having
+        to reverse-engineer it from the source.
+        """
+        parts: list[str] = []
+        for slot in range(self.max_sessions):
+            slot_file = self.sessions_dir / f"slot-{slot}.lock"
+            if not slot_file.exists():
+                continue
+            try:
+                fields = slot_file.read_text(encoding="utf-8").split()
+                holder_pid = int(fields[0])
+                claimed_at = float(fields[1])
+            except (OSError, ValueError, IndexError):
+                parts.append(f"slot={slot} pid=? age=? alive=?")
+                continue
+            # Same liveness probe _cleanup_stale uses; Windows os.kill can
+            # raise SystemError as well as OSError.
+            try:
+                os.kill(holder_pid, 0)
+                alive = "yes"
+            except (OSError, SystemError):
+                alive = "no"
+            age = max(0.0, time.time() - claimed_at)
+            parts.append(
+                f"slot={slot} pid={holder_pid} age={age:.0f}s alive={alive}"
+            )
+        return ", ".join(parts) if parts else "none recorded"
+
     def acquire(self, wait_timeout: float = SEMAPHORE_WAIT_TIMEOUT) -> int:
         """Acquire a named session slot. Waits up to wait_timeout seconds.
 
@@ -199,7 +231,8 @@ class SessionSemaphore:
             if elapsed >= wait_timeout:
                 raise BrowserBusyError(
                     f"All {self.max_sessions} browser session slots are in use. "
-                    f"Waited {wait_timeout}s. Wait for a session to finish or use --mode api."
+                    f"Waited {wait_timeout}s. Holders: {self._describe_holders()}. "
+                    f"Wait for a session to finish or use --mode api."
                 )
 
             time.sleep(1)
@@ -293,6 +326,32 @@ class BrowserLock:
 # ~/.claude/mcp-servers/browser-bridge/server.js. Don't grep-and-hunt.
 PERPLEXITY_COMMIT_KEY = "Space"
 
+# Ceiling on chromium.connect_over_cdp(). Playwright's own default is 180s, and on
+# 2026-08-22 a single hung renderer in the keeper Chrome made every attach pay that
+# full 180s -- twice per run once the fallback fired the keeper too -- turning a
+# 40s research run into a 5.5-minute failure and hiding the real cause. The
+# pre-attach sweep in cdp_health.py removes the usual cause; this constant bounds
+# the cost of any cause we have not seen yet. Fail fast, fall back, stay honest.
+CDP_CONNECT_TIMEOUT_MS = 45_000
+
+
+# Optional per-run log file. Set by _init_artifact_dir() so the structured
+# `activate_mode verify=... indicator=...` lines -- the single most useful
+# diagnostic this runner emits -- survive after the process exits. Before
+# 2026-08-22 they went to stderr only, which the MCP server discards on the
+# success path and truncates to 300 chars on the error path, so a failed run
+# left a run directory containing nothing at all.
+_RUN_LOG: "object | None" = None
+
+
+def _set_run_log(path) -> None:
+    """Open (append) the per-run log file. Best-effort; never raises."""
+    global _RUN_LOG
+    try:
+        _RUN_LOG = open(path, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        _RUN_LOG = None
+
 
 def _log(msg: str) -> None:
     """Log to stderr (stdout reserved for JSON result).
@@ -304,6 +363,12 @@ def _log(msg: str) -> None:
     hang pattern under concurrent /research-perplexity load.
     """
     print(f"  [browser] {msg}", file=sys.stderr, flush=True)
+    if _RUN_LOG is not None:
+        try:
+            _RUN_LOG.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+            _RUN_LOG.flush()
+        except Exception:
+            pass
 
 
 def _load_selectors() -> dict:
@@ -526,10 +591,20 @@ class PerplexityCouncil:
         self._artifact_dir = Path("~/.claude/council-logs/runs").expanduser() / run_id
         self._artifact_dir.mkdir(parents=True, exist_ok=True)
         self._artifact_count = 0
+        # Persist this run's log next to its artifacts (see _set_run_log).
+        _set_run_log(self._artifact_dir / "run.log")
+        _log(f"run log: {self._artifact_dir / 'run.log'}")
 
-    async def _save_artifact(self, page, label: str) -> None:
-        """Capture screenshot + HTML as forensic artifacts. Non-fatal, capped at 10."""
-        if not self.save_artifacts or not self._artifact_dir:
+    async def _save_artifact(self, page, label: str, force: bool = False) -> None:
+        """Capture screenshot + HTML as forensic artifacts. Non-fatal, capped at 10.
+
+        `force=True` captures even when --save-artifacts was not passed. Every
+        FAILURE path sets it: queue runs never pass the flag, so on 2026-08-22 the
+        run directories existed but were empty and the next lane had nothing to
+        read but the error string. A screenshot of the failing page is the single
+        artifact that would have shown the sign-in wall immediately.
+        """
+        if not (self.save_artifacts or force) or not self._artifact_dir:
             return
         if self._artifact_count >= 10:
             return
@@ -928,8 +1003,30 @@ class PerplexityCouncil:
             return False
 
         try:
+            # 2026-08-22: connect_over_cdp initialises EVERY attached page target, so
+            # one hung renderer blocks the whole attach for its full timeout. Reap
+            # unresponsive/leaked page targets over the browser-process HTTP API
+            # (which keeps answering when a renderer does not) before attaching.
+            try:
+                from cdp_health import sweep_cdp_endpoint
+
+                health = await sweep_cdp_endpoint(endpoint, log=_log)
+                if health.closed_any:
+                    _log(
+                        "MONITOR-SIGNAL cdp_wedge_reaped "
+                        f"hung={len(health.hung_closed)} junk={len(health.junk_closed)}"
+                    )
+            except Exception as sweep_error:
+                # A failed health check must never be the reason a run dies.
+                _log(
+                    "cdp_health sweep skipped "
+                    f"({type(sweep_error).__name__}: {sweep_error})"
+                )
+
             _log(f"Attaching to session_keeper via CDP at {endpoint} ...")
-            self._browser = await self.playwright.chromium.connect_over_cdp(endpoint)
+            self._browser = await self.playwright.chromium.connect_over_cdp(
+                endpoint, timeout=CDP_CONNECT_TIMEOUT_MS
+            )
             contexts = self._browser.contexts
             if not contexts:
                 _log("CDP attach: no contexts available (keeper not ready); fall back")
@@ -1081,6 +1178,20 @@ class PerplexityCouncil:
         succeeds. Because we CDP-attach to the same keeper Chrome that the keeper
         refreshes in-place, the live attached session picks up the new cookies.
         """
+        # 2026-08-22: an interactive login (--save-session, the sole setter of
+        # use_persistent) must never be gated on session freshness. This guard
+        # aborts when critical cookies are expired -- which is precisely when a
+        # human needs to sign in -- so the one command that repairs a dead
+        # session refused to run *because* the session was dead, while every
+        # other failure path told the user to run it. The bail lives here rather
+        # than at the two call sites so a third caller cannot reintroduce it.
+        if getattr(self, "use_persistent", False):
+            _log(
+                f"Interactive login ({reason}): skipping the session-freshness "
+                f"guard. Stale cookies are the reason this run exists."
+            )
+            return
+
         freshness = self._check_session_freshness(self.session_path)
         if hasattr(self, "_query_inst"):
             self._query_inst["cookies_stale_critical"] = freshness.get("stale_critical", [])
@@ -1341,6 +1452,48 @@ class PerplexityCouncil:
             })
         return cookies
 
+    @staticmethod
+    async def _is_signed_in(page) -> bool | None:
+        """Whether this page's context is signed in to a Perplexity account.
+
+        Returns True (signed in), False (definitively signed out), or None when it
+        could not be determined -- callers must not treat None as either answer.
+
+        Two independent checks, cheapest-authoritative first:
+          1. ``/api/auth/session`` -- next-auth returns ``{}`` for no session. This
+             is the same endpoint the site itself uses, so it cannot drift with a
+             UI redesign the way a selector can.
+          2. The sign-in wall's provider buttons ("Continue with Google" etc.),
+             which only render when signed out.
+        """
+        try:
+            payload = await page.evaluate(
+                """async () => {
+                    const r = await fetch('/api/auth/session', {credentials: 'include'});
+                    if (!r.ok) return null;
+                    const t = (await r.text()).trim();
+                    if (!t) return {};
+                    try { return JSON.parse(t); } catch (_) { return null; }
+                }"""
+            )
+            if isinstance(payload, dict):
+                return bool(payload)
+        except Exception as auth_error:
+            _log(f"auth probe error={auth_error!r}")
+
+        try:
+            wall = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('button, a'))
+                    .some(el => /continue with (google|apple|email)|single sign-on/i
+                        .test((el.textContent || '')))"""
+            )
+            if wall:
+                return False
+        except Exception as wall_error:
+            _log(f"sign-in-wall probe error={wall_error!r}")
+
+        return None
+
     async def validate_session(self) -> bool:
         """Check if we're logged in to Perplexity."""
         page = await self.context.new_page()
@@ -1354,12 +1507,32 @@ class PerplexityCouncil:
             textarea = self.selectors.get("textarea", "#ask-input")
             try:
                 await page.wait_for_selector(textarea, timeout=10000)
-                _log("Session valid: found input element")
-                return True
             except Exception:
                 _log("Session invalid: input element not found (not logged in?)")
-                await self._save_artifact(page, "validate_failure")
+                await self._save_artifact(page, "validate_failure", force=True)
                 return False
+
+            # 2026-08-22: the composer renders for SIGNED-OUT visitors too, so the
+            # presence of #ask-input proves the page loaded, not that we are logged
+            # in. A signed-out session then fails several steps later as the wholly
+            # misleading "Failed to activate research mode", because slash commands
+            # only exist for an account. Ask Perplexity's own auth endpoint, and
+            # fall back to the sign-in wall's buttons if that call cannot be made.
+            signed_in = await self._is_signed_in(page)
+            if signed_in is False:
+                _log(
+                    "Session invalid: SIGNED OUT (Perplexity auth endpoint reports no "
+                    "session). Cookies are present but dead server-side -- a human "
+                    "must sign in again; refreshing cookies cannot fix this."
+                )
+                _log("MONITOR-SIGNAL perplexity_signed_out")
+                await self._save_artifact(page, "validate_signed_out", force=True)
+                return False
+            if signed_in is None:
+                _log("Session check inconclusive (auth probe unavailable); proceeding")
+            else:
+                _log("Session valid: signed in")
+            return True
         finally:
             await page.close()
 
@@ -1517,6 +1690,24 @@ class PerplexityCouncil:
         Tier 2: text-scan for 'Model council' (tolerates DOM drift).
         Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        # button (same Perplexity redesign that broke the research verifier).
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'model council' || label === 'council')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=council indicator=tier0_aria_pressed")
+                return True
+        except Exception as _e0:
+            _log(f"activate_mode verify=tier0_ERROR mode=council exception={_e0!r}")
+
         # Tier 1: stable aria-label selector
         try:
             three_models = self.selectors.get("threeModelsDropdown", "button[aria-label='3 models']")
@@ -1545,12 +1736,35 @@ class PerplexityCouncil:
     async def _verify_research_activation(self, page) -> bool:
         """Verify Research mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the toolbar mode
+        button. Perplexity moved the indicator from a TEXT pill to an
+        ICON-ONLY button (aria-label="Deep research", aria-pressed="true")
+        with EMPTY textContent, so the tier1/tier2 text scans below can no
+        longer see it and falsely report SELECTOR_DRIFT. Verified via live DOM
+        probe. aria-pressed is the reliable active-state discriminator.
         Tier 1: exact-text match for the activated mode pill ("Deep research"
         or "Research" exactly). Catches the canonical activated state.
         Tier 2: case-insensitive contains scan for 'deep research' or
         exact 'research'. Tolerates minor Perplexity UI tweaks.
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'deep research' || label === 'research')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=research indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=research exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {
@@ -1591,10 +1805,28 @@ class PerplexityCouncil:
     async def _verify_labs_activation(self, page) -> bool:
         """Verify Labs mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        button (same Perplexity redesign that broke the research verifier).
         Tier 1: exact-text 'Labs' on a toolbar pill.
         Tier 2: case-insensitive contains 'labs' (looser fallback).
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (label === 'labs' && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=labs indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=labs exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {
@@ -3096,11 +3328,13 @@ class PerplexityCouncil:
                     if not await self.validate_session():
                         return {
                             "error": "Session expired or not logged in. Run: python council_browser.py --save-session",
+                            "code": "SESSION_SIGNED_OUT",
                             "step": "validate",
                         }
                 else:
                     return {
                         "error": "Session expired or not logged in. Run: python council_browser.py --save-session",
+                        "code": "SESSION_SIGNED_OUT",
                         "step": "validate",
                     }
 
@@ -3118,6 +3352,26 @@ class PerplexityCouncil:
                 )
                 await page.wait_for_timeout(2000)
 
+                # Force a desktop viewport on THIS page's own CDP session.
+                # The keeper Chrome (:9222) is shared with the /takeover phone
+                # bridge, which applies a mobile device-metrics override (~400px)
+                # for its screencast. At mobile width Perplexity collapses the
+                # composer's mode selector to an icon with no "Research"/"Deep
+                # research" text, so activate_mode's text verify fails with
+                # SELECTOR_DRIFT_DETECTED ("Failed to activate <mode> mode").
+                # setDeviceMetricsOverride is per-session and last-writer-wins on
+                # the renderer, so setting it here makes the runner immune to
+                # whatever emulation the takeover left behind. (Diagnosed 2026-07-16.)
+                try:
+                    _vp_cdp = await self.context.new_cdp_session(page)
+                    await _vp_cdp.send("Emulation.setDeviceMetricsOverride", {
+                        "width": 1440, "height": 900,
+                        "deviceScaleFactor": 1, "mobile": False,
+                    })
+                    _log("Forced desktop viewport 1440x900 (guard vs takeover mobile emulation)")
+                except Exception as _vp_e:
+                    _log(f"Desktop viewport override failed (non-fatal): {_vp_e!r}")
+
                 # submit_lock was acquired BEFORE self.start() (above) so
                 # Chrome launches ARE inside the lock — this prevents the
                 # ProcessSingleton race between concurrent Claude sessions
@@ -3132,8 +3386,27 @@ class PerplexityCouncil:
                 # released only in the outer `finally`.
                 _log(f"Activating {self.perplexity_mode} mode...")
                 if not await self.activate_mode(page):
-                    await self._save_artifact(page, "activate_failure")
-                    return {"error": f"Failed to activate {self.perplexity_mode} mode", "step": "activate"}
+                    await self._save_artifact(page, "activate_failure", force=True)
+                    # Activation is the LAST step in a long chain, so it is where
+                    # unrelated upstream faults surface. Say which browser we were
+                    # on, whether we are actually signed in, and where the evidence
+                    # is -- 2026-08-22 was six hours of chasing a selector that was
+                    # never broken. The leading phrase is unchanged so anything
+                    # matching on it keeps working.
+                    signed_in = await self._is_signed_in(page)
+                    diagnosis = (
+                        "perplexity_signed_out" if signed_in is False
+                        else "signed_in_selector_drift" if signed_in is True
+                        else "auth_state_unknown"
+                    )
+                    return {
+                        "error": f"Failed to activate {self.perplexity_mode} mode",
+                        "step": "activate",
+                        "diagnosis": diagnosis,
+                        "attached": "cdp_keeper" if self._cdp_attached else "local_profile",
+                        "url": page.url,
+                        "artifact_dir": str(self._artifact_dir) if self._artifact_dir else None,
+                    }
 
                 _log(f"Submitting query: {query[:80]}...")
                 await self.submit_query(page, query)
@@ -3167,7 +3440,7 @@ class PerplexityCouncil:
                 completed = await self.wait_for_completion(page, self.timeout)
                 if not completed:
                     _log("WARNING: Timed out waiting for completion, extracting partial results")
-                    await self._save_artifact(page, "timeout")
+                    await self._save_artifact(page, "timeout", force=True)
 
                 _log("Extracting results...")
                 results = await self.extract_results(page)
@@ -3200,7 +3473,7 @@ class PerplexityCouncil:
                 try:
                     pages = self.context.pages
                     if pages:
-                        await self._save_artifact(pages[-1], "unhandled_exception")
+                        await self._save_artifact(pages[-1], "unhandled_exception", force=True)
                 except Exception:
                     pass
             return {

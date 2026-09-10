@@ -7,6 +7,7 @@
 
 # Include root files
 !.gitignore
+!.gitattributes
 !CLAUDE.md.example
 !LICENSE
 !NOTICE
@@ -45,6 +46,12 @@
 !health-check/**
 
 # Exclude generated/runtime files within tracked dirs
+# Catch-all first: the per-directory rules below predate it and are kept for
+# clarity, but each new test package kept landing an untracked __pycache__ in
+# git status (council-automation/tests/__pycache__, 2026-09-10). One rule covers
+# every future one.
+**/__pycache__/
+**/.pytest_cache/
 council-automation/__pycache__/
 mcp-servers/browser-bridge/node_modules/
 mcp-servers/browser-bridge/package-lock.json

@@ -72,7 +72,7 @@ def _diag_asyncio_exception_handler(loop, context):
     sys.stderr.flush()
 
 # Apply the handler when the event loop is created.
-_original_run = _asyncio_diag.run
+_original_run = getattr(_asyncio_diag.run, "_council_original_run", _asyncio_diag.run)
 def _diag_asyncio_run(coro, *args, **kwargs):
     """Wrap asyncio.run to install our exception handler and surface failures."""
     try:
@@ -88,6 +88,7 @@ def _diag_asyncio_run(coro, *args, **kwargs):
         print(f"[DIAG-ASYNCIO-RUN-RAISED] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         raise
 
+_diag_asyncio_run._council_original_run = _original_run
 _asyncio_diag.run = _diag_asyncio_run
 
 import anthropic
@@ -934,13 +935,28 @@ def format_synthesis_output(results: dict) -> str:
         error_msg = results["error"]
         code = results.get("code", "UNKNOWN")
         step = results.get("step", "unknown")
+        # 2026-08-22: this block used to spell out the literal token that the
+        # MCP bridge searches stdout for when deciding whether a run was
+        # "busy". Every failure of every kind -- including a signed-out
+        # account -- was therefore re-authored as "another browser session is
+        # active", and lanes deleted lock files for hours against a fault that
+        # had no lock in it. The notes below are written with slashes so they
+        # can never be confused with the structured Code field above, which is
+        # the only thing anything should match on.
         return (
             f"# Research/Council Query FAILED\n\n"
             f"**Error:** {error_msg}\n"
             f"**Code:** {code}\n"
             f"**Step:** {step}\n\n"
-            f"If BROWSER_BUSY: another session is using Playwright. Wait ~2 min.\n"
-            f"If session expired: run `python council_browser.py --save-session`\n"
+            f"Read the Code field above; the notes below are keyed to it.\n"
+            f"- BROWSER/BUSY: another session is using Playwright. Wait ~2 min.\n"
+            f"- SESSION/STALE: Perplexity cookies are expired and auto-refresh "
+            f"could not renew them. Run `/cache-perplexity-session`, then retry. "
+            f"This aborts BEFORE submitting, so no queue slot was wasted — do not "
+            f"treat it as a transient failure to retry blindly.\n"
+            f"- SESSION/SIGNED/OUT: the account is signed out server-side. "
+            f"Refreshing cookies cannot fix it; a human must sign in "
+            f"interactively via `python council_browser.py --save-session`.\n"
         )
 
     synthesis = results.get("synthesis", {})
