@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -504,6 +505,123 @@ Produce your structured JSON synthesis now."""
             }
 
 
+# How recently a completed-but-undelivered result may be reused instead of
+# re-running the query. Long enough to cover a session dying and being restarted
+# (the 2026-08-07 intellegix-business-projections case), short enough that
+# genuinely stale research is never silently served.
+ORPHAN_RESULT_MAX_AGE_S = 2 * 60 * 60
+
+# Cap on how many cache files one lookup inspects (newest-first).
+ORPHAN_SCAN_LIMIT = 200
+
+
+def query_fingerprint(query: str, context: str, mode: str) -> str:
+    """Stable content hash identifying one logical query.
+
+    `invocation_id` is a fresh UUID per call, so a result whose caller died
+    before reading it becomes unreachable — the work succeeded but the only
+    pointer to it was lost. Fingerprinting by content lets a re-run of the same
+    query find that orphan instead of burning another few minutes reproducing it.
+    """
+    payload = f"{mode}\x00{context}\x00{query}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _result_is_usable(data: dict) -> bool:
+    """True if a cached result actually carries a synthesis (not an error stub)."""
+    if not isinstance(data, dict) or data.get("error"):
+        return False
+    synthesis = data.get("synthesis") or {}
+    if synthesis.get("error"):
+        return False
+    return bool(synthesis.get("response") or synthesis.get("parsed"))
+
+
+def _result_age_s(data: dict, path: Path, now: float) -> float | None:
+    """Seconds since the result was PRODUCED, preferring its recorded timestamp."""
+    ts = data.get("timestamp")
+    if isinstance(ts, str):
+        try:
+            produced = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if produced.tzinfo is None:
+                produced = produced.replace(tzinfo=timezone.utc)
+            return now - produced.timestamp()
+        except ValueError:
+            pass
+    try:
+        return now - path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def find_orphaned_result(
+    query: str,
+    context: str,
+    mode: str,
+    max_age_s: float = ORPHAN_RESULT_MAX_AGE_S,
+) -> dict | None:
+    """Return a recent completed result for this exact query, or None.
+
+    Scans `council_*.json` in CACHE_DIR for a usable result whose fingerprint
+    matches. Results written before fingerprints existed are matched by
+    recomputing the hash from their stored `query` field, so orphans that
+    already exist on disk are recoverable too.
+    """
+    try:
+        fp = query_fingerprint(query, context, mode)
+    except Exception:
+        return None
+    now = time.time()
+    best: tuple[float, dict] | None = None
+    try:
+        # Newest-first, bounded: the cache accumulates indefinitely and we only
+        # ever care about the last couple of hours.
+        candidates = sorted(
+            CACHE_DIR.glob("council_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:ORPHAN_SCAN_LIMIT]
+    except OSError:
+        return None
+    for path in candidates:
+        if path.name == "council_latest.json":
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # Age from the RESULT's own timestamp, not the file's mtime: recovering
+        # an orphan re-saves it under a new invocation id, which would otherwise
+        # reset mtime and let one stale result be re-served indefinitely.
+        age = _result_age_s(data, path, now)
+        if age is None or age > max_age_s:
+            continue
+        if not _result_is_usable(data):
+            continue
+        stored_fp = data.get("query_fingerprint")
+        if stored_fp is None:
+            # Pre-fingerprint result — recompute from what it recorded. `context`
+            # is not stored, so fall back to matching on the query text alone.
+            if data.get("query") != query:
+                continue
+        elif stored_fp != fp:
+            continue
+        if best is None or age < best[0]:
+            best = (age, data)
+    if best is None:
+        return None
+    age, data = best
+    print(
+        f"Orphaned-result recovery: reusing completed result for this exact query "
+        f"({int(age)}s old) instead of re-running.",
+        file=sys.stderr,
+    )
+    data = dict(data)
+    data["recovered_from_cache"] = True
+    data["recovered_age_s"] = int(age)
+    return data
+
+
 def save_results(results: dict, invocation_id: str | None = None) -> Path:
     """Save results to cache and history.
 
@@ -724,6 +842,16 @@ async def run_browser_query(
     fallback_log: list[dict] = []
     full_query = f"{context}\n\n{query}" if context else query
 
+    # Before spending minutes of browser automation, check whether this exact
+    # query already completed and its result was simply never delivered (caller
+    # died / session restarted). Opt out with COUNCIL_NO_ORPHAN_RECOVERY=1.
+    if os.environ.get("COUNCIL_NO_ORPHAN_RECOVERY", "").strip() not in ("1", "true", "True"):
+        orphan = find_orphaned_result(query, context, perplexity_mode)
+        if orphan is not None:
+            # Re-save under this invocation so the caller can read it normally.
+            save_results(orphan, invocation_id=invocation_id)
+            return orphan
+
     # Use config default (BROWSER_HEADLESS=False, i.e. headful) unless explicitly overridden
     kwargs = {"save_artifacts": opus_synthesis, "perplexity_mode": perplexity_mode}
     if headful is not None:
@@ -890,6 +1018,9 @@ async def run_browser_query(
     error_fallbacks = [f for f in fallback_log if f.get("severity") != "info"]
     results = {
         "query": query,
+        # Content hash of (mode, context, query) so a result whose caller died
+        # before reading it can still be matched by a re-run (find_orphaned_result).
+        "query_fingerprint": query_fingerprint(query, context, perplexity_mode),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mode": "browser",
         "models": models_dict,
