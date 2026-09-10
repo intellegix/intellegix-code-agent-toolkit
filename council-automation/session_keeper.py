@@ -47,6 +47,10 @@ from pathlib import Path
 #     SIGBREAK on Windows so we don't die when the parent console terminates.
 #   - Keep an idle stdin reader task pinned in the event loop so the loop never
 #     thinks it has no work to do.
+_LOG_MAX_BYTES = 5 * 1024 * 1024   # rotate session_keeper.log past ~5 MB
+_LOG_BACKUPS = 3                   # keep .log.1 .. .log.3
+
+
 def _harden_for_windows_daemon() -> None:
     """Daemonize stdio at the OS file-descriptor level so children inherit sanely.
 
@@ -79,6 +83,24 @@ def _harden_for_windows_daemon() -> None:
     try:
         log_path = Path.home() / ".claude" / "logs" / "session_keeper.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Size-based rotation AT STARTUP. The log is written by pointing fds 1/2
+        # at the file via os.dup2, so a logging.RotatingFileHandler cannot manage
+        # it -- rotation has to happen before the descriptors are opened. A
+        # one-shot process that runs every ~8 minutes gives us a natural, safe
+        # rotation point. Before this, the file had grown to 8.6 MB / 116k lines
+        # over 76 days without ever rotating.
+        # Best-effort: two keeper invocations overlapping could race on the
+        # rename, and a failed rotation must never stop the keeper from starting.
+        try:
+            if log_path.exists() and log_path.stat().st_size > _LOG_MAX_BYTES:
+                for n in range(_LOG_BACKUPS - 1, 0, -1):
+                    older, newer = log_path.with_suffix(f".log.{n + 1}"), log_path.with_suffix(f".log.{n}")
+                    if newer.exists():
+                        older.unlink(missing_ok=True)
+                        newer.replace(older)
+                log_path.replace(log_path.with_suffix(".log.1"))
+        except OSError:
+            pass
         log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         os.dup2(log_fd, 1)
         os.dup2(log_fd, 2)
@@ -129,11 +151,29 @@ KEEPER_PID_FILE = Path.home() / ".claude" / "config" / "session_keeper.pid"
 KEEPER_HEARTBEAT_FILE = Path.home() / ".claude" / "config" / "session_keeper.heartbeat"
 KEEPER_CDP_FILE = Path.home() / ".claude" / "config" / "session_keeper.cdp"
 DEFAULT_INTERVAL_S = 1200  # 20 min (CF __cf_bm has ~30min TTL; refresh well before expiry)
-DEFAULT_CDP_PORT = 9222  # Chrome DevTools Protocol port for council_browser CDP attach
+# Chrome DevTools Protocol port the keeper owns, for council_browser's CDP
+# attach. Moved off 9222 on 2026-08-08: ~/.claude/browser-relay/relay.mjs (the
+# /takeover phone relay) binds 9222 too, whichever process boots first wins,
+# and that collision caused BOTH the 08-07 and 08-08 machine-wide research
+# outages. The keeper and the relay now have disjoint ports and can coexist,
+# which is also what unblocks re-enabling the PerplexitySessionKeeper task
+# (Disabled since 2026-07-30 because re-enabling it would have fought the relay
+# for 9222). Must match council_browser.KEEPER_CDP_PORT -- both read
+# COUNCIL_KEEPER_CDP_PORT so a single env var moves them together.
+DEFAULT_CDP_PORT = int(os.environ.get("COUNCIL_KEEPER_CDP_PORT", "9223"))
 
 
 def _log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
+    # Date REQUIRED, not cosmetic. Until 2026-08-09 this emitted %H:%M:%S only,
+    # and the log is append-only across months. Grouping lines by clock-minute
+    # therefore collapses every day in the file into the same bucket, so a
+    # once-per-8-minutes schedule reads as a burst whose height equals the
+    # NUMBER OF DAYS present. That artifact cost a full evening: it produced a
+    # false all-clear, then a "69 navigations in one minute" burst hypothesis,
+    # then a retraction of the retraction, then a whole separate investigation
+    # session -- all from a timestamp that identifies its subject by clock time
+    # alone and cannot distinguish today from nine weeks ago.
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[keeper {ts}] {msg}", flush=True)
 
 
@@ -337,6 +377,55 @@ async def _navigate_and_warm(page) -> bool:
     return False
 
 
+def _cdp_serving_pid(port: int) -> int | None:
+    """PID of the process LISTENING on `port`, or None if it cannot be read.
+
+    This is the pid published in session_keeper.cdp -- readers need the process
+    that actually answers CDP, which outlives this one-shot keeper invocation.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-NetTCPConnection -LocalPort {port} -State Listen "
+             f"-ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return int((out.stdout or "").strip())
+    except Exception as exc:
+        _log(f"CDP serving-pid probe failed ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _cdp_port_owner_cmdline(port: int) -> str | None:
+    """Command line of the process LISTENING on `port`, or None if unknown.
+
+    Windows-only. None means "could not determine" and must be treated as
+    unknown, never as "foreign" -- a failed probe should not stop the keeper.
+    Mirrors council_browser.PerplexityCouncil._cdp_port_owner_cmdline.
+    """
+    if sys.platform != "win32":
+        return None
+    ps = (
+        f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+        f"-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        f"if ($c) {{ (Get-CimInstance Win32_Process -Filter "
+        f"\"ProcessId=$($c.OwningProcess)\").CommandLine }}"
+    )
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception as exc:
+        _log(f"CDP owner probe failed ({type(exc).__name__}: {exc}) - owner unknown")
+        return None
+    return (out.stdout or "").strip() or None
+
+
 async def _wait_for_cdp(port: int, timeout: float = 30.0) -> dict | None:
     """Poll Chrome's CDP /json/version endpoint until it responds, or timeout."""
     import urllib.request as _ur
@@ -438,9 +527,22 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         with _ur.urlopen(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2) as _r:
             _ = _r.read()
         chrome_already_up = True
-        _log(f"Chrome already serving CDP on port {cdp_port}; reusing it (no relaunch)")
     except Exception:
         chrome_already_up = False
+    if chrome_already_up:
+        # "Something answers CDP here" is NOT "our Chrome is here". Reusing a
+        # foreign browser hands the keeper a cookie-less profile it then
+        # publishes as the live Perplexity session -- the 2026-08-07 failure,
+        # from the other side. Prove the listener is running OUR profile dir
+        # before adopting it; otherwise refuse the port loudly rather than
+        # silently keeping a session nobody is logged in to.
+        owner = _cdp_port_owner_cmdline(cdp_port)
+        if owner is not None and keeper_profile_dir.name not in owner:
+            _log(f"REFUSING port {cdp_port}: it is served by a FOREIGN process "
+                 f"(no '{keeper_profile_dir.name}' in its command line). Set "
+                 f"COUNCIL_KEEPER_CDP_PORT to a free port. Owner: {owner[:160]}")
+            return
+        _log(f"Chrome already serving CDP on port {cdp_port}; reusing it (no relaunch)")
     if not chrome_already_up:
         # Only sweep orphans if NOTHING is serving CDP — that means whatever
         # Chrome was tied to our profile dir is in a half-dead state and
@@ -456,16 +558,63 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
     if not chrome_already_up:
         DETACHED_PROCESS = 0x00000008 if sys.platform == "win32" else 0
         CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
-        creationflags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        # CREATE_BREAKAWAY_FROM_JOB is what actually makes the one-shot design
+        # work, and its absence is why the keeper has effectively never stayed
+        # up. DETACHED_PROCESS only detaches the console; it does NOT escape a
+        # Windows job object, and every realistic launcher puts us in one --
+        # Task Scheduler assigns each task instance a job, and so does the
+        # agent harness that runs ad-hoc commands. When the launching task
+        # instance ended, the job was torn down and took Chrome with it within
+        # a minute or two, cleanly (Chrome even removed its DevToolsActivePort
+        # file, which is what made this look like a normal shutdown rather than
+        # a kill). Every subsequent run then found no CDP, fell back to a local
+        # launch, and ran the local-launch freshness guard -- the code path that
+        # produced the 2026-08-08 outage.
+        #
+        # MEASURED CAVEAT — the flag helps, but NOT under Task Scheduler.
+        # Breakaway only succeeds if the CONTAINING job grants
+        # JOB_OBJECT_LIMIT_BREAKAWAY_OK, and Task Scheduler's job does not:
+        # launched from the task, this raises [WinError 5] Access is denied and
+        # falls back below (observed 2026-08-08 07:27). Launched from an
+        # interactive shell it works and Chrome persists. This is the same
+        # constraint that killed the Santee demo app — already proved with
+        # IsProcessInJob, see memory port-registry, do not re-litigate it.
+        #
+        # The proper fix there was to make the long-lived process the task's OWN
+        # process rather than a child of it. That is NOT applied here: it would
+        # need either a new scheduled task (schtasks /Create is denied without
+        # elevation on this box) or reverting the keeper to a long-lived loop,
+        # which was abandoned in May because pythonw under Task Scheduler died
+        # silently inside asyncio.sleep (see memory session-keeper-history).
+        #
+        # Consequence, stated plainly: under Task Scheduler the keeper's Chrome
+        # lives on the order of minutes and is re-established by the task's own
+        # repetition. Nothing DEPENDS on it — the local-launch path has a
+        # correct freshness guard and a working refresher — so this is a
+        # latency optimization, not a availability requirement. Left as a known
+        # open item rather than papered over.
         import subprocess
-        chrome_proc = subprocess.Popen(
-            chrome_args,
-            creationflags=creationflags,
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000 if sys.platform == "win32" else 0
+        base_flags = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0
+        popen_kwargs = dict(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        try:
+            chrome_proc = subprocess.Popen(
+                chrome_args,
+                creationflags=base_flags | CREATE_BREAKAWAY_FROM_JOB,
+                **popen_kwargs,
+            )
+            _log("Chrome launched with CREATE_BREAKAWAY_FROM_JOB (survives launcher teardown)")
+        except OSError as exc:
+            _log(f"Job breakaway not permitted ({exc}); launching without it — "
+                 f"Chrome may not outlive this launcher")
+            chrome_proc = subprocess.Popen(
+                chrome_args, creationflags=base_flags, **popen_kwargs,
+            )
         _log(f"Chrome subprocess pid={chrome_proc.pid}; waiting for CDP port {cdp_port}...")
     # Wait for CDP to be responsive — whether from a fresh launch or a
     # pre-existing Chrome.
@@ -517,8 +666,23 @@ async def main_loop(interval_s: int, cdp_port: int = DEFAULT_CDP_PORT) -> None:
         # Windows, but Chrome's --remote-debugging-port listens on IPv4 only,
         # causing Playwright's connect_over_cdp to ECONNREFUSED on IPv6.
         cdp_endpoint = f"http://127.0.0.1:{cdp_port}"
+        # `pid` MUST be the pid of the process actually SERVING CDP, i.e. Chrome
+        # -- not this keeper python. The keeper is one-shot per invocation and
+        # exits seconds from now while its DETACHED_PROCESS Chrome lives on, so
+        # recording os.getpid() here published a pid that was always dead by the
+        # time any reader looked. council_browser's liveness gate then read the
+        # healthy keeper as a stale .cdp file, deleted it, and fell back to a
+        # local launch on EVERY run -- which is how the 08-08 outage reached the
+        # local-launch freshness guard at all. Keep the launcher pid separately
+        # for diagnostics; it is not an identity signal.
+        chrome_pid = _cdp_serving_pid(cdp_port)
         KEEPER_CDP_FILE.write_text(
-            json.dumps({"port": cdp_port, "endpoint": cdp_endpoint, "pid": os.getpid()}),
+            json.dumps({
+                "port": cdp_port,
+                "endpoint": cdp_endpoint,
+                "pid": chrome_pid,
+                "keeper_python_pid": os.getpid(),
+            }),
             encoding="utf-8",
         )
         _log(f"Refresh complete: {n} cookies written. CDP endpoint: {cdp_endpoint}")

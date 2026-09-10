@@ -21,7 +21,9 @@ import time
 from pathlib import Path
 
 import shutil
+import subprocess
 import tempfile
+import urllib.parse
 
 from council_config import (
     BROWSER_HEADLESS,
@@ -88,6 +90,20 @@ def _flag_enabled(env_var: str) -> bool:
 
 class BrowserBusyError(Exception):
     """Raised when another browser automation session holds the profile lock."""
+    pass
+
+
+class SessionStaleError(Exception):
+    """Raised when critical Perplexity cookies are EXPIRED and no refresh path
+    could renew them, so submitting the query would be knowingly doomed.
+
+    Replaces the old `keeper-timeout-stale-proceed` behaviour. Proceeding on
+    expired cookies converted a clean, diagnosable "the session is dead" into a
+    5-8 minute mid-run death that also consumed a slot on a serialized queue
+    (2026-08-08 outage: two consecutive runs burned ~9 minutes each this way).
+    Failing here costs seconds and names the fix. Set COUNCIL_ALLOW_STALE=1 to
+    restore the old proceed-anyway behaviour.
+    """
     pass
 
 
@@ -292,6 +308,31 @@ class BrowserLock:
 # this again, edit ONLY this constant + the matching one in
 # ~/.claude/mcp-servers/browser-bridge/server.js. Don't grep-and-hunt.
 PERPLEXITY_COMMIT_KEY = "Space"
+
+# Basename of the profile dir session_keeper.py launches Chrome with (see
+# session_keeper.py: keeper_profile_dir). Used to prove a CDP endpoint really
+# belongs to the keeper and not to another app squatting the same port.
+KEEPER_PROFILE_DIRNAME = "session_keeper_profile"
+KEEPER_PROFILE_DIR = Path.home() / ".claude" / "config" / KEEPER_PROFILE_DIRNAME
+
+# CDP port the keeper owns. Historically 9222 -- which is ALSO the port used by
+# the Chrome on the C:\Temp\igx-cdp-profile profile (launched by the Dogfood
+# Supervisor, start-dogfood.cmd, at logon; the profile name is browser-relay's,
+# which is why it was long misattributed to relay.mjs / /takeover). It auto-
+# starts and holds the port, so the keeper simply lost. That produced the 08-07
+# outage (runner attached to the relay's cookie-less Chrome) and again the
+# 2026-08-08 outage (relay held 9222, so the freshness guard below believed
+# "the keeper is alive" and fired a refresh that could never land). The keeper
+# now gets a DEDICATED port so the two can never contend. Override with
+# COUNCIL_KEEPER_CDP_PORT if 9223 ever conflicts. See memory port-registry.
+KEEPER_CDP_PORT = int(os.environ.get("COUNCIL_KEEPER_CDP_PORT", "9223"))
+
+# Cookies that only exist in a browser profile actually logged in to Perplexity.
+# Their absence proves the attached CDP context is not a usable keeper browser.
+PERPLEXITY_AUTH_COOKIES = {
+    "__Secure-next-auth.session-token",
+    "pplx.session-id",
+}
 
 
 def _log(msg: str) -> None:
@@ -832,6 +873,246 @@ class PerplexityCouncil:
         else:
             await self._start_non_persistent()
 
+    @staticmethod
+    def _cdp_port_owner_cmdline(port: int) -> str | None:
+        """Return the command line of the process LISTENING on `port`, or None.
+
+        Windows-only (uses Get-NetTCPConnection + Win32_Process). Returns None
+        when the owner cannot be determined — callers must treat None as
+        "unknown", never as "not the keeper", so a failed probe degrades to the
+        post-attach cookie gate rather than blocking a healthy keeper.
+        """
+        if sys.platform != "win32":
+            return None
+        ps = (
+            f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+            f"-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            f"if ($c) {{ (Get-CimInstance Win32_Process -Filter "
+            f"\"ProcessId=$($c.OwningProcess)\").CommandLine }}"
+        )
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            _log(f"CDP owner probe failed ({type(e).__name__}: {e}) — owner unknown")
+            return None
+        cmdline = (out.stdout or "").strip()
+        return cmdline or None
+
+    @classmethod
+    def _cdp_endpoint_is_keeper(cls, endpoint: str, recorded_pid: int | None) -> tuple[bool, str]:
+        """Verify a live CDP endpoint actually belongs to the session keeper.
+
+        A reachable CDP port is NOT proof the keeper is alive. Port 9222 is also
+        used by `~/.claude/browser-relay/relay.mjs` (the /takeover phone relay),
+        which launches Chrome on a throwaway `C:\\Temp\\igx-cdp-profile` with no
+        Perplexity cookies. On 2026-08-07 the keeper had been disabled since
+        07-30 while a *stale* session_keeper.cdp from 08-02 still pointed at
+        9222; when the relay claimed that port at 12:57 PT, every research run
+        attached to the relay's cookie-less Chrome and died ~128s later with
+        "Target page, context or browser has been closed". Four consecutive
+        failures, machine-wide research outage.
+
+        Returns (is_keeper, reason). `is_keeper=False` means "definitely not the
+        keeper — do not attach". An indeterminate probe returns True with a
+        reason noting the uncertainty; the post-attach cookie gate is the
+        backstop for that case.
+        """
+        # Gate ordering matters, and getting it wrong is not a safe failure.
+        #
+        # The recorded-PID check used to run FIRST and veto everything else. But
+        # the keeper is one-shot per invocation: it launches Chrome DETACHED and
+        # exits within seconds, so the pid it published was ALWAYS dead by the
+        # time a reader looked (it published its own pid, not Chrome's — fixed
+        # in session_keeper.py). Every healthy keeper was therefore judged a
+        # stale .cdp file, the file was deleted, and every run fell back to a
+        # local launch. That is how the 08-08 outage reached the local-launch
+        # freshness guard at all: an over-strict identity gate silently disabled
+        # the CDP path it was written to protect.
+        #
+        # So: run the DECISIVE gates first (DevToolsActivePort GUID, then port
+        # ownership). The recorded pid is the weakest signal — it describes the
+        # launcher, not the server — and now only breaks ties when neither
+        # decisive gate can reach a verdict.
+        port = KEEPER_CDP_PORT
+        try:
+            port = int(urllib.parse.urlparse(endpoint).port or KEEPER_CDP_PORT)
+        except Exception:
+            pass
+
+        # Gate B — DevToolsActivePort match. Chrome writes "<port>\n<ws-guid-path>"
+        # into its own --user-data-dir at startup. Comparing that GUID against the
+        # webSocketDebuggerUrl the endpoint reports is the canonical way to prove
+        # "this endpoint is the Chrome launched with THAT profile" — any process
+        # can serve plausible JSON on a port, so the response alone proves nothing.
+        # Portable (no process introspection) and decisive when the file exists.
+        active_port_file = KEEPER_PROFILE_DIR / "DevToolsActivePort"
+        try:
+            lines = active_port_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        if len(lines) >= 2 and lines[0].strip().isdigit():
+            keeper_port = int(lines[0].strip())
+            keeper_guid = lines[1].strip()
+            if keeper_port != port:
+                return False, (
+                    f"keeper's DevToolsActivePort says port {keeper_port}, "
+                    f"but endpoint points at {port}"
+                )
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen(f"{endpoint}/json/version", timeout=3) as _r:
+                    ws = json.loads(_r.read().decode()).get("webSocketDebuggerUrl", "")
+            except Exception as e:
+                return True, f"DevToolsActivePort read but /json/version probe failed ({type(e).__name__})"
+            if keeper_guid and keeper_guid in ws:
+                return True, f"DevToolsActivePort GUID matches endpoint on port {port}"
+            return False, (
+                f"endpoint on port {port} reports a different DevTools GUID than the "
+                f"keeper's profile — a foreign Chrome is serving this port"
+            )
+
+        # Gate C — no DevToolsActivePort (keeper not running, or its profile was
+        # cleaned). Fall back to checking that the process listening on the port
+        # is running the keeper's profile dir.
+        cmdline = cls._cdp_port_owner_cmdline(port)
+        if cmdline is not None:
+            if KEEPER_PROFILE_DIRNAME in cmdline:
+                return True, f"port {port} owned by keeper profile ({KEEPER_PROFILE_DIRNAME})"
+            # Label the squatter accurately -- this string is what a human
+            # reads when deciding what to go kill, and getting it wrong sends
+            # them after the wrong process. The C:\Temp\igx-cdp-profile Chrome
+            # is LAUNCHED BY the Dogfood Supervisor (start-dogfood.cmd, auto-
+            # starts at logon), verified 2026-08-08 by walking the parent chain:
+            # chrome pid -> cmd.exe -> start-dogfood.cmd. The profile name comes
+            # from browser-relay, which is why it was long misattributed to
+            # relay.mjs / /takeover. Either way it is LOAD-BEARING and must not
+            # be killed: the supervisor relaunches a byte-identical Chrome
+            # within ~3s, and the phone-takeover bridge on :7070 depends on it.
+            foreign = (
+                "Dogfood Supervisor (start-dogfood.cmd) -- load-bearing, do NOT kill"
+                if "igx-cdp-profile" in cmdline
+                else "unidentified app"
+            )
+            return False, (
+                f"port {port} is owned by a FOREIGN Chrome ({foreign}) — "
+                f"no '{KEEPER_PROFILE_DIRNAME}' in its command line"
+            )
+
+        # Gate D — last resort, and the ONLY place the recorded pid is consulted.
+        # Both decisive gates were indeterminate (no DevToolsActivePort file and
+        # the owner probe is unavailable, e.g. non-Windows), so fall back to
+        # "was the process that wrote this file still around". A dead pid here
+        # is genuine evidence of a leftover .cdp file from a previous boot.
+        if recorded_pid and recorded_pid > 0 and not cls._pid_alive(recorded_pid):
+            return False, (
+                f"no identity proof available and recorded pid {recorded_pid} is "
+                f"dead — treating .cdp file as stale"
+            )
+        return True, "port owner unknown (probe unavailable) — deferring to cookie gate"
+
+    @classmethod
+    def _keeper_cdp_alive(cls) -> tuple[bool, str]:
+        """True only if the keeper's OWN Chrome is serving CDP on KEEPER_CDP_PORT.
+
+        This is the identity-gated twin of the check `_start_via_cdp` performs.
+        It exists because the 2026-08-08 outage came from the *unguarded* copy of
+        this probe in `_ensure_fresh_session`: that one asked only "does the port
+        answer /json/version?", concluded the keeper was alive when the /takeover
+        relay held 9222, and so routed every refresh down the keeper branch --
+        which then could not possibly land. Reachability is not identity; prove
+        ownership before believing a port belongs to us.
+        """
+        endpoint = f"http://127.0.0.1:{KEEPER_CDP_PORT}"
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(f"{endpoint}/json/version", timeout=2) as _r:
+                _ = _r.read()
+        except Exception as e:
+            return False, f"no CDP on port {KEEPER_CDP_PORT} ({type(e).__name__})"
+        return cls._cdp_endpoint_is_keeper(endpoint, None)
+
+    @staticmethod
+    def _keeper_task_state() -> str:
+        """State of the PerplexitySessionKeeper scheduled task.
+
+        Returns one of "Ready" | "Running" | "Disabled" | "Missing" | "Unknown".
+
+        Firing `Start-ScheduledTask` at a **Disabled** task is a silent no-op:
+        it neither errors usefully nor runs anything. The task had been Disabled
+        since 2026-07-30, so every `_ensure_fresh_session` keeper refresh since
+        then burned the full SESSION_KEEPER_WAIT_S and then proceeded stale --
+        the 120s of dead wall-clock at the head of every doomed run on 08-08.
+        Check the state first and skip the branch when it cannot possibly work.
+        """
+        if sys.platform != "win32":
+            return "Unknown"
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "$t = Get-ScheduledTask -TaskName 'PerplexitySessionKeeper' "
+                 "-ErrorAction SilentlyContinue; "
+                 "if ($t) { $t.State } else { 'Missing' }"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except Exception as e:
+            _log(f"Keeper task-state probe failed ({type(e).__name__}: {e})")
+            return "Unknown"
+        state = (out.stdout or "").strip()
+        return state or "Unknown"
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """True if `pid` names a live process. Windows-safe (see _is_session_keeper_running)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True  # exists but inaccessible
+        except (ProcessLookupError, OSError, SystemError):
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    h = ctypes.windll.kernel32.OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+                    )
+                    if h:
+                        ctypes.windll.kernel32.CloseHandle(h)
+                        return True
+                except Exception:
+                    pass
+            return False
+
+    async def _cdp_context_has_perplexity_session(self) -> bool:
+        """True if the attached CDP context carries a Perplexity login cookie.
+
+        Backstop for `_cdp_endpoint_is_keeper` when the port-owner probe is
+        unavailable: a foreign/throwaway Chrome profile has zero perplexity.ai
+        cookies, so this separates "the keeper" from "somebody else's browser"
+        without depending on Windows process introspection. It also catches a
+        live keeper whose login has actually expired.
+        """
+        try:
+            cookies = await self.context.cookies()
+        except Exception as e:
+            _log(f"CDP cookie gate: could not read cookies ({type(e).__name__}) — allowing attach")
+            return True  # don't block on an unexpected Playwright error
+        names = {
+            c.get("name")
+            for c in cookies
+            if "perplexity.ai" in (c.get("domain") or "")
+        }
+        if names & PERPLEXITY_AUTH_COOKIES:
+            return True
+        _log(
+            f"CDP cookie gate: attached context has {len(names)} perplexity.ai cookie(s), "
+            f"none of {sorted(PERPLEXITY_AUTH_COOKIES)} — not a logged-in keeper browser"
+        )
+        return False
+
     async def _start_via_cdp(self) -> bool:
         """Attach to a running session_keeper.py via Chrome DevTools Protocol.
 
@@ -858,21 +1139,36 @@ class PerplexityCouncil:
         # removed (observed 2026-05-25 — user closed Chrome window, the file
         # got cleaned up by some path, but Chrome's child processes kept
         # serving the port).
+        # NOTE: "port 9222 answers" is NOT the same as "the keeper is up" — the
+        # /takeover browser-relay serves CDP on the same port. Only synthesize
+        # the endpoint file once the listening process is confirmed to be running
+        # the keeper's own profile, otherwise we manufacture a valid-looking
+        # endpoint pointing at somebody else's Chrome (the 2026-08-07 outage).
         if not cdp_file.exists():
             try:
                 import urllib.request as _ur
-                with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
+                with _ur.urlopen(f"http://127.0.0.1:{KEEPER_CDP_PORT}/json/version", timeout=2) as _r:
                     _ = _r.read()
+                owner = self._cdp_port_owner_cmdline(KEEPER_CDP_PORT)
+                if owner is not None and KEEPER_PROFILE_DIRNAME not in owner:
+                    _log(
+                        f"CDP-attach: port {KEEPER_CDP_PORT} is serving CDP but is NOT the keeper "
+                        f"(no '{KEEPER_PROFILE_DIRNAME}' in owner cmdline) — refusing to "
+                        "synthesize an endpoint file for a foreign browser"
+                    )
+                    raise RuntimeError("foreign CDP owner")
                 # Port is up — write a fresh CDP file so the rest of the path
                 # can use it. The keeper would have written this normally.
                 cdp_file.parent.mkdir(parents=True, exist_ok=True)
                 cdp_file.write_text(
-                    json.dumps({"port": 9222, "endpoint": "http://127.0.0.1:9222"}),
+                    json.dumps({"port": KEEPER_CDP_PORT,
+                                "endpoint": f"http://127.0.0.1:{KEEPER_CDP_PORT}"}),
                     encoding="utf-8",
                 )
-                _log("CDP-attach: Chrome alive on 9222 but .cdp file missing — synthesized it")
+                _log(f"CDP-attach: Chrome alive on {KEEPER_CDP_PORT} but .cdp file "
+                     f"missing — synthesized it")
             except Exception:
-                pass  # port not reachable; fall through to keeper auto-start
+                pass  # port not reachable / not the keeper; fall through
 
         # Auto-start the keeper task if CDP still isn't reachable. Avoids the
         # headful local-launch fallback that creates focus-stealing popups.
@@ -915,6 +1211,23 @@ class PerplexityCouncil:
                 except Exception as e:
                     _log(f"CDP-attach skipped: endpoint {endpoint_probe} unreachable ({type(e).__name__}); falling back to launch")
                     return False
+                # Reachable is not enough — prove it is the keeper's Chrome.
+                # A stale .cdp file plus a foreign app on the same port is the
+                # exact combination that produced the 2026-08-07 outage.
+                recorded_pid = data.get("pid")
+                ok, why = self._cdp_endpoint_is_keeper(
+                    endpoint_probe,
+                    recorded_pid if isinstance(recorded_pid, int) else None,
+                )
+                if not ok:
+                    _log(f"CDP-attach REFUSED: {why} — falling back to local launch")
+                    try:
+                        cdp_file.unlink()
+                        _log("Removed stale session_keeper.cdp so later runs re-probe cleanly")
+                    except Exception:
+                        pass
+                    return False
+                _log(f"CDP identity OK: {why}")
         except Exception:
             pass  # let the connect_over_cdp below try and produce its own error
         try:
@@ -939,6 +1252,19 @@ class PerplexityCouncil:
                 self._browser = None
                 return False
             self.context = contexts[0]
+
+            # Backstop identity gate: a browser that is not logged in to
+            # Perplexity is useless to us, and a foreign/throwaway profile has
+            # no perplexity.ai cookies at all. Catches the wrong-browser case
+            # even when the Windows port-owner probe was unavailable, and also
+            # catches a genuinely expired keeper login — both of which used to
+            # present as a ~128s hang ending in "browser has been closed".
+            if not await self._cdp_context_has_perplexity_session():
+                _log("CDP attach REFUSED by cookie gate — falling back to local launch")
+                self.context = None
+                self._browser = None  # never .close() a CDP browser: kills remote Chrome
+                return False
+
             self._cdp_attached = True
             existing_count = len(self.context.pages)
             _log(f"CDP attach OK: {len(contexts)} context(s); using contexts[0] with {existing_count} existing page(s)")
@@ -1075,11 +1401,17 @@ class PerplexityCouncil:
 
         Fires the keeper task (idempotent — Task Scheduler refuses a 2nd instance
         of the one-shot, so no lock is needed) and waits up to SESSION_KEEPER_WAIT_S
-        for the cookies-file mtime to bump. On timeout/failure it logs and PROCEEDS
-        with the current session — it never aborts, because an abort cascades into
-        the runner's SKIPPED-NETWORK-STREAK and a stale session still usually
-        succeeds. Because we CDP-attach to the same keeper Chrome that the keeper
-        refreshes in-place, the live attached session picks up the new cookies.
+        for the cookies-file mtime to bump, then falls back to refresh_session.py.
+        Because we CDP-attach to the same keeper Chrome that the keeper refreshes
+        in-place, the live attached session picks up the new cookies.
+
+        Raises SessionStaleError if a critical cookie is still EXPIRED after both
+        refresh paths. This reverses the pre-2026-08-08 policy of always
+        proceeding: the old rationale ("a stale session still usually succeeds")
+        holds for cookies that are merely *expiring soon*, which is why only
+        hard-expired cookies abort here. It does not hold for expired ones —
+        those produced a Cloudflare wall and a guaranteed mid-run death 5-8
+        minutes later, on a serialized queue, with no error ever logged.
         """
         freshness = self._check_session_freshness(self.session_path)
         if hasattr(self, "_query_inst"):
@@ -1106,19 +1438,39 @@ class PerplexityCouncil:
                 self._query_inst["auto_refresh_path"] = "no_refresh"
             return
 
-        # Prefer refreshing THROUGH the keeper task (no popup) when its Chrome is
-        # serving CDP; else fall back to refresh_session.py (headful popup).
-        chrome_alive = False
-        try:
-            import urllib.request as _ur
-            with _ur.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as _r:
-                _ = _r.read()
-            chrome_alive = True
-        except Exception:
-            chrome_alive = False
+        # Prefer refreshing THROUGH the keeper task (no popup) when the KEEPER'S
+        # OWN Chrome is serving CDP; else fall back to refresh_session.py.
+        #
+        # Two gates, both added 2026-08-08 after this block caused a machine-wide
+        # research outage:
+        #
+        #   1. IDENTITY, not reachability. This used to be a bare urlopen against
+        #      port 9222 -- the exact "a reachable port is a trusted port" mistake
+        #      that `_start_via_cdp` was hardened against on 08-07. The /takeover
+        #      relay held 9222, so `chrome_alive` came back True, the keeper branch
+        #      was taken, and the refresh could never land. Note the two paths
+        #      disagreed: `_start_via_cdp` correctly REFUSED the same port seconds
+        #      earlier and fell back to a local launch. Fixing one call site and
+        #      not its twin is what turned a closed bug back into an open one.
+        #
+        #   2. TASK RUNNABILITY. `Start-ScheduledTask` against a Disabled task is a
+        #      silent no-op. PerplexitySessionKeeper had been Disabled since
+        #      2026-07-30, so the wait below could only ever time out. Every run
+        #      paid SESSION_KEEPER_WAIT_S for nothing before proceeding doomed.
+        keeper_ok, keeper_why = self._keeper_cdp_alive()
+        task_state = self._keeper_task_state() if keeper_ok else "n/a"
+        keeper_usable = keeper_ok and task_state in ("Ready", "Running", "Unknown")
+        refreshed_via_keeper = False
 
-        if chrome_alive:
-            _log("Keeper Chrome alive on CDP; firing PerplexitySessionKeeper to refresh in-place...")
+        if keeper_ok and not keeper_usable:
+            _log(f"Keeper Chrome present ({keeper_why}) but its scheduled task is "
+                 f"{task_state} — firing it would be a no-op; using refresh_session.py")
+        elif not keeper_ok:
+            _log(f"Keeper CDP not usable: {keeper_why} — using refresh_session.py")
+
+        if keeper_usable:
+            _log(f"Keeper verified on CDP ({keeper_why}); task={task_state}; "
+                 f"firing PerplexitySessionKeeper to refresh in-place...")
             if hasattr(self, "_query_inst"):
                 self._query_inst["auto_refresh_path"] = "keeper_task"
             try:
@@ -1138,21 +1490,55 @@ class PerplexityCouncil:
                         mtime_now = 0.0
                     if mtime_now > mtime_before:
                         _log("Keeper refreshed cookies (mtime bumped); session fresh")
-                        return
+                        refreshed_via_keeper = True
+                        break
                     _time.sleep(1)
-                # Most likely the keeper's own ~20-min auto-cycle is mid-run, so
-                # Task Scheduler refused our 2nd instance and no bump occurred.
-                _log(f"WARN: keeper-timeout-stale-proceed (no mtime bump in "
-                     f"{SESSION_KEEPER_WAIT_S}s) — proceeding with current session")
+                if not refreshed_via_keeper:
+                    # Most likely the keeper's own ~20-min auto-cycle is mid-run,
+                    # so Task Scheduler refused our 2nd instance. Do NOT proceed
+                    # on stale cookies -- fall through to the direct refresher.
+                    _log(f"WARN: keeper did not bump cookie mtime in "
+                         f"{SESSION_KEEPER_WAIT_S}s — falling back to refresh_session.py")
             except Exception as e:
-                _log(f"Keeper-task refresh failed: {type(e).__name__}: {e} — proceeding")
-        else:
-            _log("No keeper Chrome on CDP; auto-refresh ON — invoking refresh_session.py ...")
+                _log(f"Keeper-task refresh failed: {type(e).__name__}: {e} — "
+                     f"falling back to refresh_session.py")
+
+        if not refreshed_via_keeper:
             if hasattr(self, "_query_inst"):
-                self._query_inst["auto_refresh_path"] = "refresh_session_fallback"
+                self._query_inst["auto_refresh_path"] = (
+                    "keeper_then_refresh_session" if keeper_usable else "refresh_session_fallback"
+                )
+            _log("Auto-refresh ON — invoking refresh_session.py ...")
             refreshed = await self._auto_refresh_session()
-            _log("Auto-refresh succeeded" if refreshed
-                 else "WARNING: auto-refresh failed — proceeding with stale session")
+            _log("Auto-refresh succeeded" if refreshed else "WARNING: auto-refresh failed")
+
+        # Fail loud rather than submitting a doomed run. Only HARD-EXPIRED
+        # critical cookies abort: `expiring_soon` is a soft signal (the guard
+        # fires at SESSION_FRESHNESS_THRESHOLD_S = 8 min of remaining TTL, and a
+        # session with 7 minutes left still answers fine), whereas an expired
+        # pplx.session-id / __cf_bm means Cloudflare will serve a bot challenge
+        # Playwright cannot pass and the run WILL die -- just 5-8 minutes later,
+        # after it has consumed a slot on the serialized queue.
+        post = self._check_session_freshness(self.session_path)
+        still_expired = post.get("stale_critical") or []
+        if hasattr(self, "_query_inst"):
+            self._query_inst["cookies_stale_critical"] = still_expired
+        if not still_expired:
+            return
+        if os.environ.get("COUNCIL_ALLOW_STALE", "").lower() in ("1", "true", "yes", "on"):
+            _log("COUNCIL_ALLOW_STALE=1 — proceeding on expired cookies anyway")
+            return
+        detail_expired = ", ".join(f"{n}({age}m ago)" for n, age in still_expired)
+        _log(f"MONITOR-SIGNAL session_stale_abort {detail_expired}")
+        raise SessionStaleError(
+            f"Perplexity session cookies are EXPIRED and could not be refreshed "
+            f"[{detail_expired}]. Refresh path tried: "
+            f"keeper={'usable' if keeper_usable else f'unusable ({keeper_why}, task={task_state})'}, "
+            f"refresh_session.py=failed. Aborting before submit instead of burning a "
+            f"queue slot on a run that cannot succeed. Fix: run /cache-perplexity-session, "
+            f"or check that PerplexitySessionKeeper is Enabled and owns CDP port "
+            f"{KEEPER_CDP_PORT}."
+        )
 
     async def _load_session(self) -> None:
         """Load session from playwright-session.json + playwright-localstorage.json.
@@ -1517,6 +1903,24 @@ class PerplexityCouncil:
         Tier 2: text-scan for 'Model council' (tolerates DOM drift).
         Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        # button (same Perplexity redesign that broke the research verifier).
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'model council' || label === 'council')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=council indicator=tier0_aria_pressed")
+                return True
+        except Exception as _e0:
+            _log(f"activate_mode verify=tier0_ERROR mode=council exception={_e0!r}")
+
         # Tier 1: stable aria-label selector
         try:
             three_models = self.selectors.get("threeModelsDropdown", "button[aria-label='3 models']")
@@ -1545,12 +1949,35 @@ class PerplexityCouncil:
     async def _verify_research_activation(self, page) -> bool:
         """Verify Research mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the toolbar mode
+        button. Perplexity moved the indicator from a TEXT pill to an
+        ICON-ONLY button (aria-label="Deep research", aria-pressed="true")
+        with EMPTY textContent, so the tier1/tier2 text scans below can no
+        longer see it and falsely report SELECTOR_DRIFT. Verified via live DOM
+        probe. aria-pressed is the reliable active-state discriminator.
         Tier 1: exact-text match for the activated mode pill ("Deep research"
         or "Research" exactly). Catches the canonical activated state.
         Tier 2: case-insensitive contains scan for 'deep research' or
         exact 'research'. Tolerates minor Perplexity UI tweaks.
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if ((label === 'deep research' || label === 'research')
+                        && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=research indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=research exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {
@@ -1591,10 +2018,28 @@ class PerplexityCouncil:
     async def _verify_labs_activation(self, page) -> bool:
         """Verify Labs mode activated via 2-tier selector cascade.
 
+        Tier 0 (2026-07-22): aria-label + aria-pressed on the icon-only mode
+        button (same Perplexity redesign that broke the research verifier).
         Tier 1: exact-text 'Labs' on a toolbar pill.
         Tier 2: case-insensitive contains 'labs' (looser fallback).
-        Both miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
+        All miss → SELECTOR_DRIFT_DETECTED, return False (was: optimistic True).
         """
+        # Tier 0: aria-label + aria-pressed on the icon-only mode button
+        try:
+            aria_found = await page.evaluate("""() => {
+                const els = document.querySelectorAll('[aria-label]');
+                for (const el of els) {
+                    const label = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    if (label === 'labs' && el.getAttribute('aria-pressed') === 'true') return true;
+                }
+                return false;
+            }""")
+            if aria_found:
+                _log("activate_mode verify=OK mode=labs indicator=tier0_aria_pressed")
+                return True
+        except Exception as e:
+            _log(f"activate_mode verify=tier0_ERROR mode=labs exception={e!r}")
+
         # Tier 1: exact-text match on the toolbar mode pill
         try:
             primary_found = await page.evaluate("""() => {
@@ -3068,7 +3513,24 @@ class PerplexityCouncil:
 
         try:
             _log("Starting Playwright browser...")
-            await self.start()
+            try:
+                await self.start()
+            except SessionStaleError as e:
+                # Abort cleanly instead of submitting a run that cannot succeed.
+                # Surfaced to the caller as a coded error (same shape as
+                # BROWSER_BUSY) so the MCP layer and the queue both see a real
+                # failure rather than a silent 5-8 minute death.
+                self._query_inst["chrome_path_used"] = "aborted_session_stale"
+                self._query_inst["exit_reason"] = "session_stale"
+                if not self._query_inst_emitted:
+                    _emit_query_instrumentation(self._query_inst)
+                    self._query_inst_emitted = True
+                _log(f"ABORT session_stale: {e}")
+                return {
+                    "error": str(e),
+                    "code": "SESSION_STALE",
+                    "step": "session_freshness",
+                }
 
             # CDP-attached sessions share the keeper's Chrome — no per-session
             # browser was launched, so the semaphore slot isn't actually

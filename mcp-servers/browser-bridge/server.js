@@ -1022,6 +1022,27 @@ class BrowserBridgeServer {
           return { synthesis: result };
         } catch (queryErr) {
           log.error('query_error', { invocationId, queryType, error: queryErr.message, stderr: (queryErr.stderr || '').substring(0, 300), elapsedMs: Date.now() - startMs });
+          // A timeout kill is NOT an ordinary error and must not be reported as
+          // a bare "Task failed". execFile's timeout kills the Python runner
+          // with TerminateProcess on Windows -- no signal, no unwinding -- so
+          // the runner cannot log its own failure and the queue only ever saw
+          // `started`. That is why errors_today read 0 through two machine-wide
+          // outages. research_queue.gc_dead_tickets now logs a `dropped` event
+          // for the orphaned ticket; this branch makes the CALLER's side of the
+          // same event legible instead of opaque.
+          if (queryErr.killed || queryErr.signal) {
+            return {
+              error: `Perplexity runner was killed after ${Math.round(timeout / 1000)}s `
+                + `(MCP hard timeout). The run did not fail cleanly — it was terminated `
+                + `mid-flight, so check the queue for a "dropped" event rather than assuming `
+                + `a transient error. Common causes: expired session cookies (run `
+                + `/cache-perplexity-session), or a long queue wait consuming the budget `
+                + `before the run even started (check research_queue_status depth).`,
+              code: 'RUNNER_KILLED',
+              elapsed_ms: Date.now() - startMs,
+              stderr_tail: (queryErr.stderr || '').substring(0, 800),
+            };
+          }
           throw queryErr;
         } finally {
           cleanupCtx();

@@ -181,7 +181,14 @@ def evaluate(
     seen_in_batch: Set[str] = set()
     for ev in recent_events or []:
         event = ev.get("event")
-        if event not in ("error", "timeout"):
+        # `dropped` (added 2026-08-08) is the reclaim record research_queue
+        # writes for a run whose process was killed without reporting an
+        # outcome -- the dominant real-world failure mode, since the MCP layer
+        # hard-kills the runner on timeout and Windows TerminateProcess runs no
+        # finally-blocks. It was invisible here for as long as it was invisible
+        # in errors_today, which is why two consecutive machine-wide outages
+        # were both found by hand instead of by this monitor.
+        if event not in research_queue.FAILURE_EVENTS:
             continue
         run_id = ev.get("run_id", "?")
         dedupe_key = f"{run_id}:{event}"
@@ -190,7 +197,7 @@ def evaluate(
         seen_in_batch.add(dedupe_key)
         session = ev.get("session", "?")
         detail = ev.get("error") or ev.get("query_preview") or ""
-        severity = "critical" if event == "error" else "warning"
+        severity = "warning" if event == "timeout" else "critical"
         alerts.append(
             Alert(
                 key=f"event:{dedupe_key}",
