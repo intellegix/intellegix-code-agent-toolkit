@@ -11,3 +11,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # github/codeql-action/{init,autobuild,analyze,upload-sarif} are one action
+      # and refuse to run at mixed versions: "Loaded a configuration file for
+      # version '4.37.9', but running version '4.37.6'". Ungrouped, Dependabot
+      # opened one PR per sub-action (#87/#88/#90 on 2026-08-31) and every one of
+      # them failed CodeQL on its own, because merging any single one leaves the
+      # workflow mixed. Grouping makes it one PR that is mergeable.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

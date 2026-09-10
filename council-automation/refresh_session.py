@@ -42,8 +42,74 @@ def _log(msg: str) -> None:
     print(f"[refresh_session] {msg}", flush=True)
 
 
+import datetime as _dt
+
+AUTH_SESSION_URL = "https://www.perplexity.ai/api/auth/session"
+
+
+async def _ask_perplexity_whether_signed_in(page) -> bool | None:
+    """Ask Perplexity's own auth endpoint whether this session is signed in.
+
+    next-auth returns an empty object for an anonymous visitor and a populated
+    user object for a real session, so this is authoritative and immune to UI
+    drift -- unlike looking for a composer element, which is rendered to signed
+    out visitors too.
+
+    Returns:
+        True or False when the endpoint answers, None when it cannot be reached
+        or returns something unrecognised (caller decides what to do).
+    """
+    try:
+        payload = await page.evaluate(
+            """async (url) => {
+                // Vary the URL, not just the cache mode: `cache: 'no-store'`
+                // only governs the browser's own HTTP cache, while a CDN edge
+                // cache or a service worker's Cache Storage keys on the URL and
+                // would happily replay a stale 200 for either.
+                const bust = url + (url.includes('?') ? '&' : '?') + '_cb=' + Date.now();
+                const response = await fetch(bust, {
+                    credentials: 'include',
+                    cache: 'no-store',
+                });
+                if (!response.ok) return null;
+                return await response.json();
+            }""",
+            AUTH_SESSION_URL,
+        )
+    except Exception as exc:  # network error, navigation mid-flight, CSP, ...
+        _log(f"Auth endpoint unreachable ({type(exc).__name__}: {exc})")
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not payload:
+        return False
+
+    # A non-empty body is not proof of a live session. next-auth computes
+    # `expires` from the JWT at issuance, so it can already be in the past.
+    expires = payload.get("expires")
+    if isinstance(expires, str):
+        try:
+            deadline = _dt.datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        except ValueError:
+            _log(f"Auth endpoint returned an unparseable expires ({expires!r}); "
+                 f"treating the session as UNVERIFIED rather than guessing.")
+            return None
+        if deadline <= _dt.datetime.now(_dt.timezone.utc):
+            _log(f"Auth endpoint returned a session that expired at {expires}.")
+            return False
+    return True
+
+
 async def _navigate_and_check_auth(context) -> tuple:
     """Navigate to Perplexity and check for logged-in state.
+
+    2026-08-22: this used to return True as soon as it found '#ask-input'. That
+    element is present on the SIGNED OUT homepage too, so the check reported
+    "Auth confirmed" on a completely dead session, saved the dead cookies, and
+    every run afterwards failed with "session expired or not logged in". A
+    refresh that reports success while nothing works is worse than one that
+    fails, so the authoritative auth endpoint is asked first and the selector is
+    only a fallback for when that endpoint cannot be reached.
 
     Returns (page, logged_in) tuple.
     """
@@ -54,10 +120,29 @@ async def _navigate_and_check_auth(context) -> tuple:
     _log("Waiting for auth hydration...")
     await page.wait_for_timeout(3000)
 
+    signed_in = await _ask_perplexity_whether_signed_in(page)
+    if signed_in is True:
+        _log("Auth confirmed: Perplexity's auth endpoint reports an active session")
+        return page, True
+    if signed_in is False:
+        _log(
+            "Auth check FAILED: SIGNED OUT. Perplexity's auth endpoint reports no "
+            "session, so the stored cookies are dead server-side. Saving them again "
+            "cannot help -- a human must sign in interactively."
+        )
+        _log("MONITOR-SIGNAL perplexity_signed_out")
+        return page, False
+
+    # Endpoint indeterminate. Fall back to the old selector check, but say plainly
+    # that it is weak evidence rather than logging "Auth confirmed".
     for selector in ["#ask-input", "textarea[placeholder]", "[data-testid='ask-input']"]:
         try:
             await page.wait_for_selector(selector, timeout=10000)
-            _log(f"Auth confirmed: found '{selector}'")
+            _log(
+                f"Auth UNVERIFIED: auth endpoint unreachable; found '{selector}', which "
+                f"is also present when signed out. Proceeding, but do not treat this as "
+                f"proof the session is alive."
+            )
             return page, True
         except Exception:
             continue

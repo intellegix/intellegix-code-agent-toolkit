@@ -1,0 +1,24 @@
+# Normalise line endings in the repository to LF.
+#
+# Why this file exists: this repo had no .gitattributes and the machine that
+# feeds it runs core.autocrlf=true. On 2026-08-10 an automated commit sweep
+# rewrote 211 of the 218 tracked text files from LF to CRLF in the index
+# (commit 0ec3912, "+61050/-61050") without changing a single line of content.
+# Verified 2026-09-10: every text blob on origin/master is LF-only, so this
+# file is a no-op against the current tree and exists purely to stop the churn
+# from happening again. Without it, the next sweep produces another
+# whole-repository diff that hides real changes and breaks blame.
+#
+# text=auto: git decides per file, stores LF in the index, and still checks out
+# CRLF on Windows because of core.autocrlf. Nothing about the local working
+# copy changes.
+* text=auto
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.db binary

@@ -25,7 +25,7 @@ import { WebSocket } from 'ws';
 import { writeFileSync, mkdirSync, existsSync, unlinkSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve as pathResolve } from 'node:path';
 import { homedir } from 'node:os';
-import { execFileSync, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import { CONFIG, _debugLog } from './lib/config.js';
@@ -36,6 +36,7 @@ import { ContextManager } from './lib/context-manager.js';
 import { WebSocketBridge } from './lib/websocket-bridge.js';
 import { startHealthServer } from './lib/health-server.js';
 import { MetricsCollector } from './lib/metrics.js';
+import { getBrowserCensus, buildCoverage, coverageBanner, getConnectedBrowserCount } from './lib/browser-discovery.js';
 
 _debugLog(`imports OK — cwd=${process.cwd()} argv=${process.argv.join(' ')} ppid=${process.ppid}`);
 _debugLog('[council-mcp] build=2026-04-21T10');
@@ -565,6 +566,19 @@ class BrowserBridgeServer {
           return { content };
         }
 
+        // When a negative inference from this result would be unsafe, lead with a
+        // plain-language banner ABOVE the JSON rather than relying on a field the
+        // model may skim past. Redundant with result.coverage on purpose.
+        const banner = coverageBanner(result?.result?.coverage);
+        if (banner) {
+          return {
+            content: [
+              { type: 'text', text: banner },
+              { type: 'text', text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        }
+
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
@@ -597,10 +611,28 @@ class BrowserBridgeServer {
       case 'browser_navigate': {
         const url = Validator.url(args.url);
         const tabId = Validator.tabId(args.tabId);
-        return this.bridge.broadcast({
+        const res = await this.bridge.broadcast({
           type: 'navigate',
           payload: this._withSession({ url, tabId }),
         });
+        // The extension silently opens a NEW tab when the requested tabId is not
+        // in this MCP session's tab group — which is the normal case after this
+        // server process restarts, because sessionId is regenerated per process.
+        // Reporting success with a different tabId and no explanation left callers
+        // operating on a tab they never asked for. Say so instead.
+        if (res && typeof res === 'object' && tabId && res.tabId && res.tabId !== tabId) {
+          return {
+            ...res,
+            requestedTabId: tabId,
+            retargeted: true,
+            retargetReason:
+              `Tab ${tabId} is not owned by this MCP session, so a new tab (${res.tabId}) was opened and `
+              + 'navigated instead. The requested tab was NOT navigated and still holds its previous page. '
+              + `Use tabId ${res.tabId} for follow-up calls.`,
+          };
+        }
+        if (res && typeof res === 'object' && tabId) return { ...res, requestedTabId: tabId, retargeted: false };
+        return res;
       }
 
       case 'browser_load_dynamic': {
@@ -730,8 +762,38 @@ class BrowserBridgeServer {
         });
       }
 
-      case 'browser_get_tabs':
-        return this.bridge.broadcast({ type: 'get_tabs', payload: this._withSession({}) });
+      case 'browser_get_tabs': {
+        // The tab list itself is live (chrome.tabs.query at call time), but it
+        // covers ONE browser: the extension client this bridge elected. Austin
+        // lost a morning on 2026-09-10 because that scope was never stated and an
+        // agent read silence as absence. Declare the scope every time.
+        const started = Date.now();
+        const [listing, census] = await Promise.all([
+          this.bridge.broadcast({ type: 'get_tabs', payload: this._withSession({}) }),
+          getBrowserCensus().catch(() => null),
+        ]);
+        const tabs = Array.isArray(listing?.tabs) ? listing.tabs : [];
+        const connectedBrowserClients = await getConnectedBrowserCount({
+          localCount: this.bridge.browserClients?.size ?? 0,
+          tabsReturned: Array.isArray(listing?.tabs),
+          healthPort: CONFIG.healthPort,
+        });
+        const coverage = buildCoverage({ tabCount: tabs.length, connectedBrowserClients, census });
+        // `result` is serialized first, deliberately: a caveat placed after a long
+        // array is read after the model has already anchored on the list.
+        return {
+          result: {
+            coverage,
+            freshness: {
+              status: 'FRESH',
+              asOf: coverage.asOf,
+              ageMs: Date.now() - started,
+              note: 'Enumerated live at call time from the connected browser; not a cached snapshot.',
+            },
+          },
+          tabs,
+        };
+      }
 
       case 'browser_switch_tab': {
         const tabId = Validator.tabId(args.tabId);
@@ -951,7 +1013,7 @@ class BrowserBridgeServer {
         const ctxFile = join(cacheDir, `session_context_${invocationId}.md`);
         if (includeContext) {
           try {
-            const ctxOut = execFileSync('python', [join(scriptDir, 'session_context.py'), process.cwd()], {
+            const { stdout: ctxOut } = await execFileAsync('python', [join(scriptDir, 'session_context.py'), process.cwd()], {
               timeout: CONFIG.timeouts.councilExec,
               encoding: 'utf-8',
               env: pythonEnv,
@@ -989,8 +1051,15 @@ class BrowserBridgeServer {
             cwd: scriptDir,
           });
           let result = raw.stdout;
-          // Check for browser busy error (concurrent session holding the profile lock)
-          if (result.includes('BROWSER_BUSY')) {
+          // Check for browser busy error (concurrent session holding the profile lock).
+          // 2026-08-22: this used to be `result.includes('BROWSER_BUSY')`, a bare
+          // substring search over the child's whole stdout. council_query.py prints an
+          // unconditional troubleshooting block on EVERY failure, and that block
+          // contained the literal token — so a signed-out account, a selector drift and
+          // a real lock contention all came back to the caller as "another browser
+          // session is active". Lanes deleted lock files for hours against a fault that
+          // had no lock in it. Match only the structured Code field the runner emits.
+          if (/^\s*\*\*Code:\*\*\s*BROWSER_BUSY\s*$/m.test(result)) {
             log.warn('query_browser_busy', { invocationId, queryType, elapsedMs: Date.now() - startMs });
             return {
               error: 'Another browser council/research session is active. Wait ~2 min or use --mode api.',
@@ -1031,7 +1100,7 @@ class BrowserBridgeServer {
       case 'council_metrics': {
         const scriptDir = join(homedir(), '.claude', 'council-automation');
         const pyEnv = { ...process.env, PYTHONIOENCODING: 'utf-8' };
-        const result = execFileSync('python', [
+        const { stdout: result } = await execFileAsync('python', [
           join(scriptDir, 'council_metrics.py'), '--json',
         ], {
           timeout: CONFIG.timeouts.councilExec,
@@ -1047,7 +1116,7 @@ class BrowserBridgeServer {
         const scriptDir = join(homedir(), '.claude', 'council-automation');
         const pyEnv = { ...process.env, PYTHONIOENCODING: 'utf-8' };
 
-        const result = execFileSync('python', [
+        const { stdout: result } = await execFileAsync('python', [
           join(scriptDir, 'council_query.py'),
           level === 'full' ? '--read-full' : level === 'synthesis' ? '--read' : '--read-model',
           ...(level !== 'full' && level !== 'synthesis' ? [level] : []),
@@ -1370,6 +1439,70 @@ class BrowserBridgeServer {
   // Relay mode — connect to existing WS server as client
   // -----------------------------------------------------------------------
 
+  /**
+   * Owner re-election. Called when a relay client sees ECONNREFUSED, which
+   * means the process that owned the WebSocket port has exited.
+   *
+   * The election primitive is the bind itself: on Windows an exclusive bind to
+   * a specific loopback address is an OS-backed mutex, so exactly one racing
+   * process wins and the rest get EADDRINUSE. That is only true while we bind
+   * the SAME explicit address every time and never opt into SO_REUSEADDR /
+   * reusePort / exclusive:false — those make Windows accept a second binder and
+   * dispatch connections nondeterministically, which would give us two owners.
+   *
+   * Losing is the normal case and is NOT an error: the winner is now serving,
+   * so the loser just goes back to relaying. A promoted owner starts a fresh
+   * browser-session epoch — in-memory state does not transfer with the port.
+   */
+  async _tryPromoteToOwner(scheduleReconnect) {
+    if (this._electing || this._relayConnected) return;
+    this._electing = true;
+    try {
+      await this.bridge.start();
+      this.healthServer = await startHealthServer(this.bridge, rateLimiter, this.metrics);
+      this._relayConnected = false;
+      this._relayMode = false;
+      if (this._relayReconnectTimer) {
+        clearTimeout(this._relayReconnectTimer);
+        this._relayReconnectTimer = null;
+      }
+      // BUG FIX (2026-08-29): _connectAsRelay() shadows this.bridge.broadcast and
+      // this.bridge.getStatus with instance-level relay overrides that forward
+      // through this._relayWs. Promotion rebinds the real WS+health servers but
+      // NEVER removed those overrides, so a promoted (formerly-relay) process kept
+      // running the stale relay-mode broadcast()/getStatus() forever:
+      //   - getStatus() always reported {mode:'relay', connected:false,
+      //     clientCount:0} on /health regardless of real browser-client state —
+      //     a false negative that made the extension look disconnected when it
+      //     might not have been.
+      //   - broadcast() tried to send over this._relayWs, which is null/dead
+      //     post-promotion (the ECONNREFUSED that triggered promotion means the
+      //     old primary — and this relay connection to it — is gone), so any
+      //     code path calling this.bridge.broadcast() directly on the promoted
+      //     instance (rather than through the real WebSocketBridge#_onMessage
+      //     relay_forward path) would wrongly reject with "Relay not connected
+      //     to primary server" instead of using the newly-live real bridge.
+      // Deleting the own-properties restores WebSocketBridge.prototype's real
+      // broadcast()/getStatus() now that this instance genuinely owns the ports.
+      delete this.bridge.broadcast;
+      delete this.bridge.getStatus;
+      _debugLog('_tryPromoteToOwner() WON election — now primary');
+      console.error('[BrowserBridge] Previous owner exited — promoted to primary');
+    } catch (err) {
+      if (err.code === 'EADDRINUSE') {
+        // Expected: another client won the race, or the old listener has not
+        // released yet. Not an error, and deliberately not logged as one.
+        _debugLog('_tryPromoteToOwner() lost election — staying relay');
+      } else {
+        console.error('[BrowserBridge] Promotion failed:', err.message);
+      }
+      this._electing = false;
+      scheduleReconnect();
+      return;
+    }
+    this._electing = false;
+  }
+
   _connectAsRelay() {
     _debugLog(`_connectAsRelay() entered — target ws://${CONFIG.wsHost}:${CONFIG.wsPort}`);
     return new Promise((resolve, reject) => {
@@ -1378,6 +1511,30 @@ class BrowserBridgeServer {
       this._relayPending = new Map();
       this._relayReconnectTimer = null;
       this._relayConnected = false;
+      this._relayAttempt = 0;        // full-jitter backoff exponent
+      this._electing = false;        // single-flight guard for promotion
+
+      // Full jitter (AWS "Exponential Backoff and Jitter"). A constant delay
+      // made ~20 relay clients retry in the SAME millisecond; measured
+      // 2026-08-22, that herd produced 10,415 ECONNREFUSED in 24h against
+      // only 104 process starts. Randomising the whole interval disperses it.
+      const backoffDelay = () => {
+        const capped = Math.min(
+          CONFIG.relayReconnectCapMs,
+          CONFIG.relayReconnectDelay * 2 ** Math.min(this._relayAttempt, 6),
+        );
+        this._relayAttempt += 1;
+        return Math.floor(Math.random() * capped);
+      };
+
+      const scheduleReconnect = () => {
+        if (this._relayReconnectTimer || this._electing) return;  // single-flight
+        const delay = backoffDelay();
+        this._relayReconnectTimer = setTimeout(() => {
+          this._relayReconnectTimer = null;
+          connect(false);
+        }, delay);
+      };
 
       const connect = (isInitial = false) => {
         _debugLog(`_connectAsRelay() connect() isInitial=${isInitial}`);
@@ -1386,6 +1543,7 @@ class BrowserBridgeServer {
         ws.on('open', () => {
           this._relayWs = ws;
           this._relayConnected = true;
+          this._relayAttempt = 0;   // reset backoff only on a real connection
           _debugLog('_connectAsRelay() WS open — sending relay_init');
           console.error('[BrowserBridge] Relay connected to primary WS server');
 
@@ -1448,15 +1606,27 @@ class BrowserBridgeServer {
             pending.reject(new Error('Relay connection lost'));
           }
           this._relayPending.clear();
-          this._relayReconnectTimer = setTimeout(() => connect(false), CONFIG.relayReconnectDelay);
+          scheduleReconnect();
         });
 
         ws.on('error', (err) => {
-          _debugLog(`_connectAsRelay() WS error: ${err.code || err.message} isInitial=${isInitial} connected=${this._relayConnected}`);
-          console.error('[BrowserBridge] Relay WS error:', err.message);
+          const code = err.code || err.message;
+          _debugLog(`_connectAsRelay() WS error: ${code} isInitial=${isInitial} connected=${this._relayConnected}`);
           if (isInitial && !this._relayConnected) {
             reject(err);
+            return;
           }
+          // ECONNREFUSED means the OWNER PROCESS IS GONE — its session ended and
+          // nobody re-bound the port. Retrying a dead port forever is what caused
+          // the outage: the tools stay missing, and every drop/re-add of them
+          // invalidates the whole prompt cache (tools sit at prefix position 0).
+          // So try to BECOME the owner instead of waiting for one to reappear.
+          if (code === 'ECONNREFUSED') {
+            this._tryPromoteToOwner(scheduleReconnect);
+            return;
+          }
+          console.error('[BrowserBridge] Relay WS error:', err.message);
+          scheduleReconnect();
         });
       };
 

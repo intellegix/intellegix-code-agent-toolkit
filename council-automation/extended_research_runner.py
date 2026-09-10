@@ -2617,17 +2617,39 @@ def main() -> int:
         # detection, parser bug, malformed responses) abort the run instead of
         # burning the full pass budget. The caller can salvage raw responses from
         # salvaged-responses.md.
-        recent_statuses = [p.get("status") for p in ledger["pass_log"][-PARSE_FAIL_STREAK_THRESHOLD:]]
+        recent_passes = ledger["pass_log"][-PARSE_FAIL_STREAK_THRESHOLD:]
+        recent_statuses = [p.get("status") for p in recent_passes]
         if (
             len(recent_statuses) >= PARSE_FAIL_STREAK_THRESHOLD
             and all(s == "PARSE-FAILED" for s in recent_statuses)
         ):
+            # 2026-08-22: this message used to GUESS ("expired session / Cloudflare /
+            # parser regression") while the runner already held the real reason in
+            # each pass record's own `error` field. On 2026-07-22 and again today
+            # that guess sent people to /cache-perplexity-session for a fault that
+            # had nothing to do with cookies, costing hours both times. Report what
+            # the runner was actually told, and only then offer the speculation.
+            underlying = []
+            for record in recent_passes:
+                err = str(record.get("error") or "").strip()
+                if err and err not in underlying:
+                    underlying.append(err[:200])
+            observed = (
+                " Underlying errors reported by the passes themselves: "
+                + "; ".join(underlying)
+                + "."
+                if underlying
+                else " The passes recorded no underlying error, which itself points at "
+                     "a runner-side parser problem rather than an upstream failure."
+            )
             termination_reason = (
                 f"PARSE-FAILED-STREAK ({PARSE_FAIL_STREAK_THRESHOLD} consecutive passes returned "
-                f"unparseable responses). Likely causes: expired Perplexity session — run "
-                f"`/cache-perplexity-session`; bot detection / Cloudflare lockout; or "
-                f"runner-side parser regression. Raw responses preserved in salvaged-responses.md "
-                f"for manual review."
+                f"unparseable responses)." + observed +
+                f" If those errors do not name a cause, the usual suspects are an expired "
+                f"Perplexity session (run `/cache-perplexity-session`), bot detection / "
+                f"Cloudflare lockout, or a runner-side parser regression — but check the "
+                f"per-run run.log under ~/.claude/council-logs/runs/ before assuming any of "
+                f"them. Raw responses preserved in salvaged-responses.md for manual review."
             )
             log(termination_reason, "ERROR")
             break

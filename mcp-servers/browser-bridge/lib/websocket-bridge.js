@@ -17,6 +17,42 @@ export class WebSocketBridge extends EventEmitter {
     this.pendingRequests = new Map();     // requestId -> { resolve, reject, timer }
     this.heartbeatTimer = null;
     this.cachedPageContext = null;
+    // projectPath -> { timer, sessionId } — session cleanups deferred so a
+    // restarting lane can reclaim its own tabs. See CONFIG.sessionCleanupGrace.
+    this.pendingSessionCleanups = new Map();
+  }
+
+  /**
+   * Close a relay session's tabs after a grace period, so an MCP server process
+   * that is merely restarting does not have its own tabs destroyed underneath it.
+   * Cancelled by _cancelPendingCleanup when a relay for the same project reconnects.
+   */
+  _scheduleSessionCleanup(sessionId, projectPath) {
+    const key = projectPath || `session:${sessionId}`;
+    const existing = this.pendingSessionCleanups.get(key);
+    if (existing) clearTimeout(existing.timer);
+
+    const timer = setTimeout(() => {
+      this.pendingSessionCleanups.delete(key);
+      const cleanup = { type: 'session_cleanup', payload: { sessionId } };
+      for (const [clientWs] of this.browserClients) this._send(clientWs, cleanup);
+      log.info('session_cleanup_sent', { sessionId: sessionId.slice(0, 8), projectPath, deferredMs: CONFIG.sessionCleanupGrace });
+    }, CONFIG.sessionCleanupGrace);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    this.pendingSessionCleanups.set(key, { timer, sessionId });
+    log.info('session_cleanup_deferred', { sessionId: sessionId.slice(0, 8), projectPath, graceMs: CONFIG.sessionCleanupGrace });
+  }
+
+  /** A relay for this project reconnected in time — keep its tabs. */
+  _cancelPendingCleanup(projectPath) {
+    if (!projectPath) return false;
+    const pending = this.pendingSessionCleanups.get(projectPath);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingSessionCleanups.delete(projectPath);
+    log.info('session_cleanup_cancelled', { sessionId: pending.sessionId.slice(0, 8), projectPath, reason: 'relay reconnected within grace period' });
+    return true;
   }
 
   start() {
@@ -77,11 +113,8 @@ export class WebSocketBridge extends EventEmitter {
       // When a relay disconnects, emit event for recovery handling and tell browser clients to close its session tabs
       if (closingInfo && closingInfo.role === 'stdio-relay' && closingInfo.sessionId) {
         this.emit('relayDisconnected', { sessionId: closingInfo.sessionId, pid: closingInfo.pid });
-        const cleanup = { type: 'session_cleanup', payload: { sessionId: closingInfo.sessionId } };
-        for (const [clientWs] of this.browserClients) {
-          this._send(clientWs, cleanup);
-        }
-        console.error(`[WebSocketBridge] Sent session_cleanup for relay session ${closingInfo.sessionId.slice(0, 8)}`);
+        this._scheduleSessionCleanup(closingInfo.sessionId, closingInfo.projectPath);
+        console.error(`[WebSocketBridge] Deferred session_cleanup for relay session ${closingInfo.sessionId.slice(0, 8)} (${CONFIG.sessionCleanupGrace}ms grace)`);
       }
     });
 
@@ -124,8 +157,11 @@ export class WebSocketBridge extends EventEmitter {
         browserInfo.sessionId = msg.payload?.sessionId;
         browserInfo.lastActivity = Date.now();
         browserInfo.pid = msg.payload?.pid;
+        browserInfo.projectPath = msg.payload?.projectPath;
         this.relayClients.set(ws, browserInfo);
       }
+      // A replacement relay for the same project: keep the outgoing session's tabs.
+      this._cancelPendingCleanup(msg.payload?.projectPath);
       log.info('relay_connect', { clientId: browserInfo?.id, pid: msg.payload?.pid, sessionId: msg.payload?.sessionId?.slice(0, 8), totalRelays: this.relayClients.size });
       this.emit('relayConnected', { sessionId: msg.payload?.sessionId, pid: msg.payload?.pid, projectPath: msg.payload?.projectPath, projectLabel: msg.payload?.projectLabel });
       return;
@@ -376,6 +412,8 @@ export class WebSocketBridge extends EventEmitter {
 
   stop() {
     clearInterval(this.heartbeatTimer);
+    for (const [, pending] of this.pendingSessionCleanups) clearTimeout(pending.timer);
+    this.pendingSessionCleanups.clear();
     for (const [ws] of this.browserClients) ws.close(1000, 'Server shutting down');
     for (const [ws] of this.relayClients) ws.close(1000, 'Server shutting down');
     for (const [, pending] of this.pendingRequests) {
