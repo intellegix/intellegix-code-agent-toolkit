@@ -136,4 +136,4 @@ After every test run, present results as:
 - If a tool returns `success: false` -> report the error, do not retry blindly
 - If the intro fails (story_state < 3) -> report the story_state value and which phase stalled
 - If ROM is not loaded -> call `nds_load_rom` with the ROM path first
-- Default ROM path: `C:/Users/AustinKidwell/ASR Dropbox/Austin Kidwell/04_ResearchAnalysis/pokeheartgold-master/pokeheartgold.us.nds`
+- Default ROM path: `$NDS_ROM_DIR/pokeheartgold.us.nds`

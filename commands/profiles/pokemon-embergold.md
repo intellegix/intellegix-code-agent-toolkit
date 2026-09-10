@@ -2,7 +2,7 @@
 
 ## Identification
 - **ROM Title Pattern:** `POKEMON EMER` or `POKEMON FIRE`
-- **Guide Path:** `C:\Users\AustinKidwell\ASR Dropbox\Austin Kidwell\04_ResearchAnalysis\pokefirered-master\pokefirered-master\docs\gba-claude-guide.md`
+- **Guide Path:** `$GBA_DECOMP_DIR/docs/gba-claude-guide.md`
 
 ## MCP Tools (Game-Specific)
 This game provides custom MCP tools beyond the generic `gba_*` set:

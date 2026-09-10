@@ -29,7 +29,7 @@ This project is being developed using Claude Code, Anthropic's official CLI tool
 
 All documentation lives at:
 ```
-C:/Users/AustinKidwell/ASR Dropbox/Austin Kidwell/08_Financial_PayrollOperations/Certified Payroll/Raken API
+$RAKEN_REFERENCE_DIR
 ```
 
 ### Key Files (MUST be read in Step 0)

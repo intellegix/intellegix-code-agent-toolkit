@@ -13,7 +13,7 @@ Examples: /raken-api timeCards, /raken-api members, /raken-api dailyReports oaut
 ## Documentation Directory
 
 ```
-C:/Users/AustinKidwell/ASR Dropbox/Austin Kidwell/08_Financial_PayrollOperations/Certified Payroll/Raken API
+$RAKEN_REFERENCE_DIR
 ```
 
 ## Execution
