@@ -293,6 +293,10 @@ class BrowserLock:
 # ~/.claude/mcp-servers/browser-bridge/server.js. Don't grep-and-hunt.
 PERPLEXITY_COMMIT_KEY = "Space"
 
+# The slash-command palette's items (2026-10-30 Lexical typeahead). Clicked in
+# preference to PERPLEXITY_COMMIT_KEY -- see _commit_mode_choice.
+PALETTE_MENUITEM_SELECTOR = '#typeahead-menu [role="menuitem"]'
+
 
 def _log(msg: str) -> None:
     """Log to stderr (stdout reserved for JSON result).
@@ -1464,12 +1468,13 @@ class PerplexityCouncil:
             f"chars={len(slash_cmd)} elapsed_ms={int((time.perf_counter() - t0) * 1000)}"
         )
 
-        # Press the Perplexity commit key (Space — see PERPLEXITY_COMMIT_KEY).
-        await page.keyboard.press(PERPLEXITY_COMMIT_KEY)
+        # Commit the palette choice. Click the matching typeahead item when one
+        # rendered; fall back to PERPLEXITY_COMMIT_KEY only when it did not.
+        committed_by = await self._commit_mode_choice(page)
         await page.wait_for_timeout(1500)  # Wait for activation
         _log(
             f"activate_mode step=commit_pressed mode={self.perplexity_mode} "
-            f"key={PERPLEXITY_COMMIT_KEY} "
+            f"key={committed_by} "
             f"elapsed_ms={int((time.perf_counter() - t0) * 1000)}"
         )
 
@@ -1491,7 +1496,7 @@ class PerplexityCouncil:
         if ok:
             _log(
                 f"activate_mode SUCCESS mode={self.perplexity_mode} "
-                f"key={PERPLEXITY_COMMIT_KEY} elapsed_ms={elapsed_ms}"
+                f"key={committed_by} elapsed_ms={elapsed_ms}"
             )
         else:
             # Capture the current URL on failure. If it's /search/<uuid>,
@@ -1505,10 +1510,36 @@ class PerplexityCouncil:
                 current_url = "<unknown>"
             _log(
                 f"activate_mode FAIL step=verify mode={self.perplexity_mode} "
-                f"key={PERPLEXITY_COMMIT_KEY} elapsed_ms={elapsed_ms} "
+                f"key={committed_by} elapsed_ms={elapsed_ms} "
                 f"url={current_url}"
             )
         return ok
+
+    async def _commit_mode_choice(self, page) -> str:
+        """Commit the slash-command palette choice; return how it was committed.
+
+        2026-10-30: the palette became a Lexical typeahead (#typeahead-menu,
+        role="menuitem", e.g. "Deep Research") that ignores Space. For ~45h every
+        research run typed "/research", pressed Space, left the menu open with the
+        mode never engaged, and died as "Failed to activate research mode" while
+        the page was signed in. Clicking the item is a trusted Playwright event and
+        does not depend on which key Perplexity binds next. With no matching item
+        we fall back to the key, so an older UI keeps working.
+        """
+        try:
+            item = page.locator(PALETTE_MENUITEM_SELECTOR).filter(
+                has_text=re.compile(re.escape(self.perplexity_mode), re.IGNORECASE)
+            ).first
+            if await item.count() > 0:
+                await item.click(timeout=3000)
+                return "click_menuitem"
+        except Exception as e:
+            _log(
+                f"activate_mode step=menuitem_click_ERROR mode={self.perplexity_mode} "
+                f"error={e!r}"
+            )
+        await page.keyboard.press(PERPLEXITY_COMMIT_KEY)
+        return PERPLEXITY_COMMIT_KEY
 
     async def _verify_council_activation(self, page) -> bool:
         """Verify Council mode activated via 2-tier selector cascade.
